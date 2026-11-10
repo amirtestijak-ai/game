@@ -37,68 +37,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DATA_DIR = Path("/data") if Path("/data").is_dir() else Path(".")
-DB_PATH = str(DATA_DIR / "secret_society.sqlite3")
-ASSET_DIR = DATA_DIR / "mission_assets"
-ASSET_DIR.mkdir(parents=True, exist_ok=True)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # مالک اصلی
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "").strip()
+DB_PATH = "secret_society.sqlite3"
+ASSET_DIR = Path("mission_assets")
+ASSET_DIR.mkdir(exist_ok=True)
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise RuntimeError("Set BOT_TOKEN and ADMIN_ID environment variables first.")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-REQUIRED_CHANNEL = "@dsgjnjjyfg"
-REQUIRED_CHANNEL_URL = "https://t.me/dsgjnjjyfg"
-BUTTON_STYLES = {}
-BUTTON_STYLE_DEFAULTS = {
-    "admin:newmission": "success",
-    "admin:missions": "primary",
-    "admin:rewards": "success",
-    "admin:xp": "primary",
-    "admin:announce": "primary",
-    "admin:stats": "primary",
-    "admin:admins": "primary",
-    "admin:pendingmissions": "primary",
-    "admin:referrals": "success",
-    "admin:colors": "primary",
-    "user:missions": "primary",
-    "user:profile": "primary",
-    "user:reward": "success",
-    "user:leaderboard": "primary",
-    "user:referral": "success",
-    "user:daily": "success",
-}
-BUTTON_LABELS = {
-    "admin:newmission": "ساخت مأموریت",
-    "admin:missions": "مأموریت‌ها",
-    "admin:rewards": "درخواست جایزه‌ها",
-    "admin:xp": "دادن XP",
-    "admin:announce": "پیام همگانی",
-    "admin:stats": "آمار ربات",
-    "admin:admins": "مدیریت ادمین‌ها",
-    "admin:pendingmissions": "بررسی پاسخ مأموریت‌ها",
-    "admin:referrals": "گزارشات رفرال",
-    "user:missions": "مأموریت‌ها",
-    "user:profile": "پروفایل",
-    "user:reward": "درخواست بررسی جایزه",
-    "user:leaderboard": "رتبه‌بندی",
-    "user:referral": "دعوت دوستان",
-    "user:daily": "جایزه روزانه",
-}
-BUTTON_STYLE_CHOICES = ("primary", "success", "danger")
-
-def make_button(text, callback_data, style="primary", **kwargs):
-    # Telegram supports preset inline-button styles, not arbitrary RGB colors.
-    selected = BUTTON_STYLES.get(callback_data, BUTTON_STYLES.get(callback_data.split(":")[0] + ":" + callback_data.split(":")[1] if ":" in callback_data else callback_data, style))
-    return InlineKeyboardButton(text=text, callback_data=callback_data, style=selected, **kwargs)
-
-async def load_button_styles():
-    async with aiosqlite.connect(DB_PATH) as db:
-        rows = await (await db.execute("SELECT button_key, style FROM button_styles")).fetchall()
-    BUTTON_STYLES.clear()
-    BUTTON_STYLES.update({key: value for key, value in rows})
 
 RANKS = [
     ("Initiate", 0),
@@ -118,6 +67,9 @@ class AdminFlow(StatesGroup):
     xp_user_id = State()
     xp_amount = State()
     announce_text = State()
+    channel_announce_text = State()
+    channel_link = State()
+    text_value = State()
     add_admin_id = State()
     mission_submission = State()
 
@@ -161,25 +113,71 @@ def kb(rows):
 
 def admin_kb():
     return kb([
-        [make_button(text="➕ ساخت مأموریت", callback_data="admin:newmission", style="success"),
-         make_button(text="📋 مأموریت‌ها", callback_data="admin:missions", style="primary")],
-        [make_button(text="🎁 درخواست جایزه‌ها", callback_data="admin:rewards", style="success"),
-         make_button(text="⭐ دادن XP", callback_data="admin:xp", style="primary")],
-        [make_button(text="📢 پیام همگانی", callback_data="admin:announce", style="primary"),
-         make_button(text="📊 آمار ربات", callback_data="admin:stats", style="primary")],
-        [make_button(text="👥 گزارشات رفرال", callback_data="admin:referrals", style="success"),
-         make_button(text="🎨 تغییر رنگ دکمه‌ها", callback_data="admin:colors", style="primary")],
+        [InlineKeyboardButton(text="➕ ساخت مأموریت", callback_data="admin:newmission", style="success"),
+         InlineKeyboardButton(text="📋 مأموریت‌ها", callback_data="admin:missions", style="primary")],
+        [InlineKeyboardButton(text="🎁 درخواست جایزه‌ها", callback_data="admin:rewards", style="success"),
+         InlineKeyboardButton(text="⭐ دادن XP", callback_data="admin:xp", style="primary")],
+        [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="admin:announce", style="primary"),
+         InlineKeyboardButton(text="📣 پیام به کانال", callback_data="admin:channelannounce", style="primary")],
+        [InlineKeyboardButton(text="✏️ ویرایش متن‌ها", callback_data="admin:edittexts", style="primary"),
+         InlineKeyboardButton(text="🔗 تغییر لینک کانال", callback_data="admin:channellink", style="primary")],
+        [InlineKeyboardButton(text="👑 ادمین‌ها", callback_data="admin:admins", style="success"),
+         InlineKeyboardButton(text="📊 آمار ربات", callback_data="admin:stats", style="primary")],
     ])
 
-def user_kb():
-    return kb([
-        [make_button(text="🗂 مأموریت‌ها", callback_data="user:missions", style="primary"),
-         make_button(text="🪪 پروفایل", callback_data="user:profile", style="primary")],
-        [make_button(text="🎁 درخواست بررسی جایزه", callback_data="user:reward", style="success")],
-        [make_button(text="🏆 رتبه‌بندی", callback_data="user:leaderboard", style="primary")],
-        [make_button(text="🔗 دعوت دوستان", callback_data="user:referral", style="success"),
-         make_button(text="🎁 جایزه روزانه", callback_data="user:daily", style="success")],
-    ])
+def user_kb(user_is_admin=False):
+    rows = [
+        [InlineKeyboardButton(text="🚀 شروع بازی", callback_data="user:missions", style="success"),
+         InlineKeyboardButton(text="📖 راهنما", callback_data="user:guide", style="primary")],
+        [InlineKeyboardButton(text="🗂 مأموریت‌ها", callback_data="user:missions", style="primary"),
+         InlineKeyboardButton(text="🪪 پروفایل", callback_data="user:profile", style="primary")],
+        [InlineKeyboardButton(text="🎁 درخواست بررسی جایزه", callback_data="user:reward", style="success")],
+        [InlineKeyboardButton(text="🏆 رتبه‌بندی", callback_data="user:leaderboard", style="primary")],
+        [InlineKeyboardButton(text="🔗 دعوت دوستان", callback_data="user:referral", style="success"),
+         InlineKeyboardButton(text="🎁 جایزه روزانه", callback_data="user:daily", style="success")],
+    ]
+    if user_is_admin:
+        rows.append([InlineKeyboardButton(text="🛠 پنل مدیریت", callback_data="admin:openpanel", style="primary")])
+    else:
+        rows.append([InlineKeyboardButton(text="🛠 پنل", callback_data="admin:openpanel", style="primary")])
+    return kb(rows)
+
+TEXT_DEFAULTS = {
+    "welcome": ("🕶️ <b>به SECRET SOCIETY خوش آمدی</b>\n"
+                "📁 پرونده عضویتت ساخته شد.\n"
+                "🎯 مأموریت‌ها را انجام بده، XP جمع کن و رتبه‌ات را ارتقا بده.\n"
+                "از منوی زیر شروع کن."),
+    "guide": ("📖 <b>راهنمای بازی SECRET SOCIETY</b>\n"
+              "🚀 از دکمه شروع بازی وارد بخش مأموریت‌ها شو.\n"
+              "🗂 مأموریت‌ها را باز کن و توضیحات هر مأموریت را بخوان.\n"
+              "📩 پاسخ یا مدرک انجام مأموریت را بفرست تا مدیر بررسی کند.\n"
+              "⭐ بعد از تأیید، XP می‌گیری و رتبه‌ات بالاتر می‌رود.\n"
+              "🎁 با جمع‌کردن حداقل ۵۰۰۰ XP می‌توانی درخواست جایزه ثبت کنی.\n"
+              "🔗 با دعوت دوستان و دریافت پاداش روزانه هم XP بیشتری جمع کن."),
+}
+
+async def get_setting(key: str, default: str = "") -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT value FROM settings WHERE key=?", (key,))).fetchone()
+    return row[0] if row else default
+
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        await db.commit()
+
+async def channel_destination():
+    link = (await get_setting("channel_link", CHANNEL_LINK)).strip()
+    if not link:
+        return None
+    if link.startswith("@"):
+        return link
+    clean = link.rstrip("/")
+    if "t.me/" in clean:
+        tail = clean.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        if tail and not tail.startswith("+") and not tail.startswith("joinchat/"):
+            return "@" + tail
+    return None
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -197,13 +195,17 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT DEFAULT 'pending',
             created_at TEXT)""")
         await db.execute("CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         await db.execute("CREATE TABLE IF NOT EXISTS referrals(invitee_id INTEGER PRIMARY KEY, inviter_id INTEGER, created_at TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS pending_referrals(invitee_id INTEGER PRIMARY KEY, inviter_id INTEGER, created_at TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS button_styles(button_key TEXT PRIMARY KEY, style TEXT NOT NULL)")
         await db.execute("CREATE TABLE IF NOT EXISTS referral_bonus(user_id INTEGER PRIMARY KEY, awarded_at TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS daily_claims(user_id INTEGER, claim_date TEXT, PRIMARY KEY(user_id, claim_date))")
         await db.execute("CREATE TABLE IF NOT EXISTS mission_submissions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, mission_id INTEGER, answer TEXT, file_id TEXT, status TEXT DEFAULT 'pending', submitted_at TEXT)")
         await db.commit()
+    for key, value in TEXT_DEFAULTS.items():
+        if not await get_setting(key):
+            await set_setting(key, value)
+    if CHANNEL_LINK and not await get_setting("channel_link"):
+        await set_setting("channel_link", CHANNEL_LINK)
 
 async def ensure_user(user):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -246,118 +248,38 @@ def make_dossier_image(mission_id: int, title: str) -> str:
     img.save(path)
     return str(path)
 
-async def is_channel_member(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status in ("creator", "administrator", "member") or (
-            member.status == "restricted" and bool(getattr(member, "is_member", False))
-        )
-    except Exception:
-        return False
-
-def join_required_markup():
-    return kb([
-        [InlineKeyboardButton(text="📢 عضویت در کانال", url=REQUIRED_CHANNEL_URL)],
-        [make_button("✅ تأیید عضویت", "membership:verify", style="success")]
-    ])
-
-async def complete_user_registration(user):
-    await ensure_user(user)
-    async with aiosqlite.connect(DB_PATH) as db:
-        pending = await (await db.execute(
-            "SELECT inviter_id FROM pending_referrals WHERE invitee_id=?", (user.id,)
-        )).fetchone()
-        if pending:
-            inviter = int(pending[0])
-            if inviter != user.id:
-                exists = await (await db.execute(
-                    "SELECT 1 FROM referrals WHERE invitee_id=?", (user.id,)
-                )).fetchone()
-                inviter_exists = await (await db.execute(
-                    "SELECT 1 FROM users WHERE user_id=?", (inviter,)
-                )).fetchone()
-                if not exists and inviter_exists:
-                    now = datetime.now(timezone.utc).isoformat()
-                    await db.execute(
-                        "INSERT INTO referrals(invitee_id,inviter_id,created_at) VALUES(?,?,?)",
-                        (user.id, inviter, now)
-                    )
-                    await db.execute("UPDATE users SET xp=xp+5 WHERE user_id=?", (inviter,))
-                    count = (await (await db.execute(
-                        "SELECT COUNT(*) FROM referrals WHERE inviter_id=?", (inviter,)
-                    )).fetchone())[0]
-                    bonus = await (await db.execute(
-                        "SELECT 1 FROM referral_bonus WHERE user_id=?", (inviter,)
-                    )).fetchone()
-                    if count >= 15 and not bonus:
-                        await db.execute("UPDATE users SET xp=xp+200 WHERE user_id=?", (inviter,))
-                        await db.execute(
-                            "INSERT INTO referral_bonus(user_id,awarded_at) VALUES(?,?)",
-                            (inviter, now)
-                        )
-                        await bot.send_message(
-                            inviter, "🏆 جایزه ویژه دعوت! به ۱۵ دعوت موفق رسیدی و ۲۰۰ XP جایزه گرفتی!"
-                        )
-                    await bot.send_message(
-                        inviter, f"🎉 یک عضو جدید با لینک تو وارد شد! +5 XP\\nدعوت موفق: {count}/15"
-                    )
-            await db.execute("DELETE FROM pending_referrals WHERE invitee_id=?", (user.id,))
-        await db.commit()
-
-async def show_join_gate(message: Message):
-    await message.answer(
-        "🔒 برای استفاده از SECRET SOCIETY اول باید عضو کانال زیر بشی.\\n"
-        "بعد از عضویت، دکمه «تأیید عضویت» رو بزن.",
-        reply_markup=join_required_markup()
-    )
-
 @dp.message(CommandStart())
 async def start(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
-        already_registered = await (await db.execute("SELECT 1 FROM users WHERE user_id=?", (message.from_user.id,))).fetchone()
+        was_registered = await (await db.execute("SELECT 1 FROM users WHERE user_id=?", (message.from_user.id,))).fetchone()
+    await ensure_user(message.from_user)
+    # Telegram deep-link referral: /start ref_<inviter_id>; only brand-new accounts count.
     parts = (message.text or "").split(maxsplit=1)
-    if not already_registered and len(parts) > 1 and parts[1].startswith("ref_"):
+    if not was_registered and len(parts) > 1 and parts[1].startswith("ref_"):
         try:
             inviter = int(parts[1][4:])
             if inviter != message.from_user.id:
                 async with aiosqlite.connect(DB_PATH) as db:
-                    inviter_exists = await (await db.execute(
-                        "SELECT 1 FROM users WHERE user_id=?", (inviter,)
-                    )).fetchone()
-                    if inviter_exists:
-                        await db.execute(
-                            "INSERT OR IGNORE INTO pending_referrals(invitee_id,inviter_id,created_at) VALUES(?,?,?)",
-                            (message.from_user.id, inviter, datetime.now(timezone.utc).isoformat())
-                        )
+                    exists = await (await db.execute("SELECT 1 FROM referrals WHERE invitee_id=?", (message.from_user.id,))).fetchone()
+                    inviter_exists = await (await db.execute("SELECT 1 FROM users WHERE user_id=?", (inviter,))).fetchone()
+                    if not exists and inviter_exists:
+                        await db.execute("INSERT INTO referrals(invitee_id,inviter_id,created_at) VALUES(?,?,?)", (message.from_user.id, inviter, datetime.now(timezone.utc).isoformat()))
+                        await db.execute("UPDATE users SET xp=xp+5 WHERE user_id=?", (inviter,))
                         await db.commit()
+                        count = (await (await db.execute("SELECT COUNT(*) FROM referrals WHERE inviter_id=?", (inviter,))).fetchone())[0]
+                        bonus = await (await db.execute("SELECT 1 FROM referral_bonus WHERE user_id=?", (inviter,))).fetchone()
+                        if count >= 15 and not bonus:
+                            await db.execute("UPDATE users SET xp=xp+200 WHERE user_id=?", (inviter,))
+                            await db.execute("INSERT INTO referral_bonus(user_id,awarded_at) VALUES(?,?)", (inviter, datetime.now(timezone.utc).isoformat()))
+                            await db.commit()
+                            await bot.send_message(inviter, "🏆 جایزه ویژه دعوت! به ۱۵ دعوت موفق رسیدی و ۲۰۰ XP جایزه گرفتی!")
+                        await bot.send_message(inviter, f"🎉 یک عضو جدید با لینک تو وارد شد! +5 XP\nدعوت موفق: {count}/15")
         except (ValueError, aiosqlite.Error):
             pass
-
-    if not await is_channel_member(message.from_user.id):
-        return await show_join_gate(message)
-
-    await complete_user_registration(message.from_user)
-    greeting = ("🕶️ <b>به SECRET SOCIETY خوش آمدی</b>\\n\\n"
-                "📁 پرونده‌ی عضویتت ساخته شد.\\n"
-                "🎯 مأموریت‌ها را انجام بده، XP جمع کن، رتبه‌ات را ارتقا بده و به شورای سایه نزدیک شو.\\n\\n"
-                "🔐 <i>هر عضو، یک پرونده. هر مأموریت، یک آزمون.</i>\\n\\nاز منوی زیر شروع کن، Operative.")
-    await message.answer(greeting, reply_markup=user_kb(), parse_mode="HTML")
-
-@dp.callback_query(F.data == "membership:verify")
-async def verify_membership(call: CallbackQuery):
-    if not await is_channel_member(call.from_user.id):
-        return await call.answer("هنوز عضویتت در کانال تأیید نشده.", show_alert=True)
-    await complete_user_registration(call.from_user)
-    await call.answer("عضویت تأیید شد ✅")
-    greeting = ("🕶️ <b>به SECRET SOCIETY خوش آمدی</b>\\n\\n"
-                "📁 پرونده‌ی عضویتت ساخته شد.\\n"
-                "🎯 مأموریت‌ها را انجام بده، XP جمع کن، رتبه‌ات را ارتقا بده و به شورای سایه نزدیک شو.\\n\\n"
-                "🔐 <i>هر عضو، یک پرونده. هر مأموریت، یک آزمون.</i>\\n\\nاز منوی زیر شروع کن، Operative.")
-    await call.message.answer(greeting, reply_markup=user_kb(), parse_mode="HTML")
-
-@dp.callback_query(F.data == "noop:join")
-async def noop_join(call: CallbackQuery):
-    await call.answer()
+    greeting = await get_setting("welcome", TEXT_DEFAULTS["welcome"])
+    # متن‌ها از پنل قابل تغییرند؛ خط‌های خالی اضافی نمایش داده نمی‌شوند.
+    greeting = greeting.replace("\n\n", "\n\n")
+    await message.answer(greeting, reply_markup=user_kb(await is_admin(message.from_user.id)), parse_mode="HTML")
 
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
@@ -371,7 +293,32 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         return await call.answer("دسترسی غیرمجاز", show_alert=True)
     action = call.data.split(":", 1)[1]
     await call.answer()
-    if action == "newmission":
+    if action == "openpanel":
+        if not await is_admin(call.from_user.id):
+            return await call.message.answer("⛔ این بخش فقط برای مدیران است.")
+        await call.message.answer("🛠 <b>پنل مدیریت سازمان</b>", reply_markup=admin_kb(), parse_mode="HTML")
+    elif action == "edittexts":
+        await call.message.answer("✏️ کدام متن را می‌خواهی ویرایش کنی؟", reply_markup=kb([
+            [InlineKeyboardButton(text="متن خوش‌آمدگویی", callback_data="admin:edittext:welcome")],
+            [InlineKeyboardButton(text="متن راهنما", callback_data="admin:edittext:guide")],
+            [InlineKeyboardButton(text="⬅️ پنل", callback_data="admin:openpanel")]
+        ]))
+    elif action.startswith("edittext:"):
+        key = action.split(":", 1)[1]
+        if key not in TEXT_DEFAULTS:
+            return await call.message.answer("متن موردنظر پیدا نشد.")
+        await state.update_data(edit_text_key=key)
+        await state.set_state(AdminFlow.text_value)
+        current = await get_setting(key, TEXT_DEFAULTS[key])
+        await call.message.answer("متن جدید را بفرست. برای حفظ قالب‌بندی می‌توانی از خط جدید استفاده کنی.\n\nمتن فعلی:\n" + current, parse_mode="HTML")
+    elif action == "channellink":
+        current = await get_setting("channel_link", CHANNEL_LINK)
+        await state.set_state(AdminFlow.channel_link)
+        await call.message.answer("لینک جدید کانال را بفرست (مثلاً https://t.me/channel یا @channel).\nلینک فعلی: " + (current or "ثبت نشده"))
+    elif action == "channelannounce":
+        await state.set_state(AdminFlow.channel_announce_text)
+        await call.message.answer("متن پست کانال را بفرست. پست با دکمه «ورود به بازی» منتشر می‌شود.")
+    elif action == "newmission":
         await state.set_state(AdminFlow.mission_title)
         await call.message.answer("عنوان مأموریت جدید را ارسال کن:")
     elif action == "missions":
@@ -392,8 +339,8 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
             await call.message.answer(
                 f"🎁 درخواست #{rid}\nUser ID: <code>{uid}</code>\n{created}",
                 parse_mode="HTML",
-                reply_markup=kb([[make_button(text="✅ تأیید", callback_data=f"reward:approve:{rid}"),
-                                  make_button(text="❌ رد", callback_data=f"reward:reject:{rid}")]])
+                reply_markup=kb([[InlineKeyboardButton(text="✅ تأیید", callback_data=f"reward:approve:{rid}"),
+                                  InlineKeyboardButton(text="❌ رد", callback_data=f"reward:reject:{rid}")]])
             )
     elif action == "xp":
         await state.set_state(AdminFlow.xp_user_id)
@@ -406,8 +353,12 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
             return await call.message.answer("⛔ فقط مالک ربات می‌تواند ادمین اضافه کند.")
         async with aiosqlite.connect(DB_PATH) as db:
             rows = await (await db.execute("SELECT user_id FROM admins ORDER BY added_at DESC")).fetchall()
-        admin_text = "\n".join(str(r[0]) for r in rows) or "ادمین فرعی ثبت نشده."
-        await call.message.answer("👑 ادمین‌های فعلی:\n" + admin_text + "\n\nبرای افزودن ادمین، دکمه زیر را بزن.", reply_markup=kb([[make_button(text="➕ افزودن ادمین", callback_data="admin:addadmin")]]))
+        admin_text = f"مالک اصلی: {ADMIN_ID}\n" + ("\n".join(f"ادمین دوم: {r[0]}" for r in rows) if rows else "ادمین دوم: ثبت نشده")
+        buttons = []
+        if len({ADMIN_ID, *(r[0] for r in rows)}) < 2:
+            buttons.append([InlineKeyboardButton(text="➕ افزودن ادمین دوم", callback_data="admin:addadmin", style="success")])
+        buttons.append([InlineKeyboardButton(text="⬅️ پنل", callback_data="admin:openpanel")])
+        await call.message.answer("👑 فهرست مدیران\n" + admin_text + "\n\nحداکثر دو مدیر قابل ثبت است.", reply_markup=kb(buttons))
     elif action == "addadmin":
         if not await is_owner(call.from_user.id):
             return await call.message.answer("⛔ فقط مالک ربات.")
@@ -418,93 +369,7 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
             rows = await (await db.execute("SELECT id,user_id,mission_id,answer FROM mission_submissions WHERE status='pending' ORDER BY id DESC LIMIT 20")).fetchall()
         if not rows: return await call.message.answer("ارسال بررسی‌نشده‌ای وجود ندارد.")
         for sid, uid, mid, answer in rows:
-            await call.message.answer(f"📨 ارسال #{sid} | کاربر {uid} | مأموریت #{mid}\n{(answer or '[بدون متن]')[:1500]}", reply_markup=kb([[make_button(text="✅ قبول + XP", callback_data=f"submission:approve:{sid}"), make_button(text="❌ رد", callback_data=f"submission:reject:{sid}")]]))
-    elif action == "colors":
-        rows = []
-        for key, label in BUTTON_LABELS.items():
-            rows.append([make_button(f"🎨 {label}", f"admin:colorpick:{key}", style=BUTTON_STYLES.get(key, BUTTON_STYLE_DEFAULTS.get(key, "primary")))])
-        rows.append([make_button("↩️ بازگشت به پنل", "admin:back", style="primary")])
-        await call.message.answer(
-            "🎨 <b>تغییر رنگ دکمه‌ها</b>\\nدکمه موردنظر رو انتخاب کن.\\n"
-            "رنگ‌های قابل پشتیبانی تلگرام: آبی، سبز و قرمز.",
-            reply_markup=kb(rows), parse_mode="HTML"
-        )
-    elif action.startswith("colorpick:"):
-        key = action.split(":", 1)[1]
-        if key not in BUTTON_LABELS:
-            return await call.answer("دکمه معتبر نیست.", show_alert=True)
-        choices = [
-            [make_button("🔵 آبی", f"admin:colorset:primary:{key}", style="primary")],
-            [make_button("🟢 سبز", f"admin:colorset:success:{key}", style="success")],
-            [make_button("🔴 قرمز", f"admin:colorset:danger:{key}", style="danger")],
-            [make_button("↩️ بازگشت", "admin:colors", style="primary")]
-        ]
-        await call.message.answer(f"رنگ جدید دکمه «{BUTTON_LABELS[key]}» رو انتخاب کن:", reply_markup=kb(choices))
-    elif action.startswith("colorset:"):
-        parts = action.split(":", 2)
-        if len(parts) != 3:
-            return await call.answer("درخواست نامعتبر است.", show_alert=True)
-        style, key = parts[1], parts[2]
-        if style not in BUTTON_STYLE_CHOICES or key not in BUTTON_LABELS:
-            return await call.answer("تنظیم نامعتبر است.", show_alert=True)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO button_styles(button_key,style) VALUES(?,?) ON CONFLICT(button_key) DO UPDATE SET style=excluded.style",
-                (key, style)
-            )
-            await db.commit()
-        BUTTON_STYLES[key] = style
-        await call.answer("رنگ دکمه ذخیره شد ✅")
-        await call.message.answer(f"✅ رنگ «{BUTTON_LABELS[key]}» تغییر کرد.", reply_markup=admin_kb())
-    elif action == "back":
-        await call.message.answer("🛠 <b>پنل مدیریت سازمان</b>", reply_markup=admin_kb(), parse_mode="HTML")
-    elif action.startswith("referrals"):
-        try:
-            page = int(action.split(":", 1)[1]) if ":" in action else 0
-        except ValueError:
-            page = 0
-        page = max(0, page)
-        page_size = 15
-        async with aiosqlite.connect(DB_PATH) as db:
-            total = (await (await db.execute("SELECT COUNT(*) FROM referrals")).fetchone())[0]
-            rows = await (await db.execute(
-                """SELECT r.created_at,
-                          i.user_id, i.username, i.first_name, i.xp,
-                          u.user_id, u.username, u.first_name, u.xp
-                   FROM referrals r
-                   LEFT JOIN users i ON i.user_id=r.inviter_id
-                   LEFT JOIN users u ON u.user_id=r.invitee_id
-                   ORDER BY r.created_at DESC LIMIT ? OFFSET ?""",
-                (page_size, page * page_size)
-            )).fetchall()
-            top = await (await db.execute(
-                """SELECT u.user_id,u.username,u.first_name,COUNT(r.invitee_id)
-                   FROM users u JOIN referrals r ON r.inviter_id=u.user_id
-                   GROUP BY u.user_id ORDER BY COUNT(r.invitee_id) DESC LIMIT 5"""
-            )).fetchall()
-        lines = [f"👥 <b>گزارش رفرال‌ها</b>\\nکل دعوت‌های موفق: <b>{total}</b>\\nصفحه: {page+1}\\n"]
-        for created, iid, iu, inf, ixp, uid, uu, unf, uxp in rows:
-            lines.append(
-                f"━━━━━━━━━━━━\\n"
-                f"👤 <b>دعوت‌کننده:</b> {inf or 'بدون نام'} (@{iu or 'ندارد'})\\n"
-                f"🆔 ID: <code>{iid}</code> | XP: {ixp or 0}\\n"
-                f"➕ <b>عضو دعوت‌شده:</b> {unf or 'بدون نام'} (@{uu or 'ندارد'})\\n"
-                f"🆔 ID: <code>{uid}</code> | XP: {uxp or 0}\\n"
-                f"🕒 {created}"
-            )
-        if not rows:
-            lines.append("هنوز دعوت موفقی ثبت نشده.")
-        if top:
-            lines.append("\\n🏆 <b>بیشترین دعوت‌ها</b>")
-            for rank, (uid, username, first_name, count) in enumerate(top, 1):
-                lines.append(f"{rank}. {first_name or 'کاربر'} (@{username or 'ندارد'}) — {count} دعوت | <code>{uid}</code>")
-        nav = []
-        if page > 0:
-            nav.append(make_button("⬅️ قبلی", f"admin:referrals:{page-1}", style="primary"))
-        if (page + 1) * page_size < total:
-            nav.append(make_button("بعدی ➡️", f"admin:referrals:{page+1}", style="primary"))
-        markup = kb([nav]) if nav else None
-        await call.message.answer("\\n".join(lines)[:4000], parse_mode="HTML", reply_markup=markup)
+            await call.message.answer(f"📨 ارسال #{sid} | کاربر {uid} | مأموریت #{mid}\n{(answer or '[بدون متن]')[:1500]}", reply_markup=kb([[InlineKeyboardButton(text="✅ قبول + XP", callback_data=f"submission:approve:{sid}"), InlineKeyboardButton(text="❌ رد", callback_data=f"submission:reject:{sid}")]]))
     elif action == "stats":
         async with aiosqlite.connect(DB_PATH) as db:
             users = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
@@ -519,10 +384,68 @@ async def add_admin_id(message: Message, state: FSMContext):
     except (ValueError, AttributeError): return await message.answer("User ID باید عدد باشد.")
     if uid == ADMIN_ID: return await message.answer("این کاربر مالک اصلی است.")
     async with aiosqlite.connect(DB_PATH) as db:
+        count = (await (await db.execute("SELECT COUNT(*) FROM admins")).fetchone())[0]
+        existing = await (await db.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,))).fetchone()
+        if not existing and count >= 1:
+            await state.clear()
+            return await message.answer("ظرفیت تکمیل است؛ ربات حداکثر دو مدیر دارد (مالک اصلی + یک ادمین دوم).", reply_markup=admin_kb())
         await db.execute("INSERT OR IGNORE INTO admins(user_id,added_by,added_at) VALUES(?,?,?)", (uid, message.from_user.id, datetime.now(timezone.utc).isoformat()))
         await db.commit()
     await state.clear()
     await message.answer(f"👑 کاربر {uid} به فهرست ادمین‌ها اضافه شد.", reply_markup=admin_kb())
+
+@dp.message(AdminFlow.text_value)
+async def save_text_value(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    key = data.get("edit_text_key")
+    if key not in TEXT_DEFAULTS:
+        await state.clear()
+        return await message.answer("نوع متن نامعتبر است.")
+    value = (message.text or "").strip()
+    if not value:
+        return await message.answer("متن خالی قابل ذخیره نیست؛ متن را دوباره بفرست.")
+    await set_setting(key, value[:4000])
+    await state.clear()
+    await message.answer("✅ متن ذخیره شد.", reply_markup=admin_kb())
+
+@dp.message(AdminFlow.channel_link)
+async def save_channel_link(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    value = (message.text or "").strip()
+    if not (value.startswith("@") or "t.me/" in value):
+        return await message.answer("لینک معتبر بفرست؛ مثل https://t.me/channel یا @channel")
+    await set_setting("channel_link", value)
+    await state.clear()
+    await message.answer("✅ لینک کانال ذخیره شد.", reply_markup=admin_kb())
+
+@dp.message(AdminFlow.channel_announce_text)
+async def channel_announcement(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    destination = await channel_destination()
+    if not destination:
+        return await message.answer("اول از پنل، لینک عمومی کانال را ثبت کن. برای انتشار، ربات باید در کانال دسترسی ارسال پیام داشته باشد.")
+    text_value = (message.text or message.caption or "").strip()
+    if not text_value:
+        return await message.answer("متن پست را بفرست.")
+    me = await bot.get_me()
+    game_url = f"https://t.me/{me.username}?start=play"
+    markup = kb([[InlineKeyboardButton(text="🎮 ورود به بازی", url=game_url, style="success")]])
+    try:
+        if message.photo:
+            await bot.send_photo(destination, message.photo[-1].file_id, caption=text_value[:1000], reply_markup=markup)
+        elif message.document:
+            await bot.send_document(destination, message.document.file_id, caption=text_value[:1000], reply_markup=markup)
+        else:
+            await bot.send_message(destination, text_value[:4000], reply_markup=markup)
+    except Exception as exc:
+        await state.clear()
+        return await message.answer(f"❌ ارسال به کانال انجام نشد. مطمئن شو ربات ادمین کانال است و لینک عمومی درست است.\nخطا: {str(exc)[:300]}", reply_markup=admin_kb())
+    await state.clear()
+    await message.answer("✅ پست در کانال منتشر شد.", reply_markup=admin_kb())
 
 @dp.message(AdminFlow.mission_title)
 async def mission_title(message: Message, state: FSMContext):
@@ -596,15 +519,15 @@ async def announcement(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("user:"))
 async def user_callbacks(call: CallbackQuery):
-    if not await is_channel_member(call.from_user.id):
-        await call.answer("برای استفاده از ربات باید عضو کانال باشی.", show_alert=True)
-        try: await call.message.answer("🔒 ابتدا عضو کانال شو و سپس تأیید عضویت را بزن.", reply_markup=join_required_markup())
-        except Exception: pass
-        return
-    await complete_user_registration(call.from_user)
+    await ensure_user(call.from_user)
     action = call.data.split(":", 1)[1]
     await call.answer()
-    if action == "profile":
+    if action == "startgame":
+        await call.message.answer("🎮 بازی شروع شد! از منوی زیر یک بخش را انتخاب کن.", reply_markup=user_kb(await is_admin(call.from_user.id)))
+    elif action == "guide":
+        guide = await get_setting("guide", TEXT_DEFAULTS["guide"])
+        await call.message.answer(guide, parse_mode="HTML", reply_markup=kb([[InlineKeyboardButton(text="🚀 شروع بازی", callback_data="user:missions")]]))
+    elif action == "profile":
         async with aiosqlite.connect(DB_PATH) as db:
             row = await (await db.execute("SELECT xp FROM users WHERE user_id=?", (call.from_user.id,))).fetchone()
         xp = row[0] if row else 0
@@ -617,7 +540,7 @@ async def user_callbacks(call: CallbackQuery):
             rows = await (await db.execute("SELECT id,title,description,xp,image_path FROM missions WHERE active=1 ORDER BY id DESC")).fetchall()
         if not rows: return await call.message.answer("فعلاً مأموریت فعالی وجود ندارد.")
         for mid,title,desc,xp,img_path in rows:
-            markup = kb([[make_button(text="📩 ارسال پاسخ برای بررسی", callback_data=f"mission:submit:{mid}", style="success")]])
+            markup = kb([[InlineKeyboardButton(text="📩 ارسال پاسخ برای بررسی", callback_data=f"mission:submit:{mid}", style="success")]])
             caption = f"🗂 <b>CASE #{mid:04d}</b>\n<b>{title}</b>\n\n{desc}\n\n🎯 پاداش: {xp} XP"
             try:
                 with open(img_path, "rb") as f:
@@ -636,9 +559,13 @@ async def user_callbacks(call: CallbackQuery):
             rid = cur.lastrowid
             await db.commit()
         await call.message.answer("🎁 درخواستت برای مدیر ارسال شد. منتظر بررسی باش.")
-        await bot.send_message(ADMIN_ID, f"🎁 درخواست جایزه #{rid}\nUser: {call.from_user.id}\nUsername: @{call.from_user.username or 'ندارد'}",
-                               reply_markup=kb([[make_button(text="✅ تأیید", callback_data=f"reward:approve:{rid}"),
-                                                 make_button(text="❌ رد", callback_data=f"reward:reject:{rid}")]]))
+        for admin_uid in await admin_ids():
+            try:
+                await bot.send_message(admin_uid, f"🎁 درخواست جایزه #{rid}\nUser: {call.from_user.id}\nUsername: @{call.from_user.username or 'ندارد'}",
+                                       reply_markup=kb([[InlineKeyboardButton(text="✅ تأیید", callback_data=f"reward:approve:{rid}"),
+                                                         InlineKeyboardButton(text="❌ رد", callback_data=f"reward:reject:{rid}")]]))
+            except Exception:
+                pass
     elif action == "referral":
         me = await bot.get_me()
         async with aiosqlite.connect(DB_PATH) as db:
@@ -662,8 +589,6 @@ async def user_callbacks(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("mission:submit:"))
 async def mission_submit(call: CallbackQuery, state: FSMContext):
-    if not await is_channel_member(call.from_user.id):
-        return await call.answer("ابتدا عضو کانال شو.", show_alert=True)
     mid = int(call.data.rsplit(":", 1)[1])
     async with aiosqlite.connect(DB_PATH) as db:
         row = await (await db.execute("SELECT title FROM missions WHERE id=? AND active=1", (mid,))).fetchone()
@@ -677,9 +602,6 @@ async def mission_submit(call: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminFlow.mission_submission)
 async def receive_mission_submission(message: Message, state: FSMContext):
-    if not await is_channel_member(message.from_user.id):
-        await state.clear()
-        return await show_join_gate(message)
     data = await state.get_data(); mid = data.get("submission_mission_id")
     answer = message.text or message.caption or ""
     file_id = message.photo[-1].file_id if message.photo else (message.document.file_id if message.document else None)
@@ -694,7 +616,7 @@ async def receive_mission_submission(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("📨 پاسخ محرمانه‌ات برای بررسی ارسال شد. نتیجه در همین ربات اعلام می‌شود.", reply_markup=user_kb())
     text = f"🕵️ ارسال مأموریت #{sid}\nعنوان: {mission[0]}\nکاربر: {message.from_user.id} (@{message.from_user.username or 'بدون username'})\n\n{answer[:3000]}"
-    markup = kb([[make_button(text="✅ تأیید + XP", callback_data=f"submission:approve:{sid}"),make_button(text="❌ رد", callback_data=f"submission:reject:{sid}")]])
+    markup = kb([[InlineKeyboardButton(text="✅ تأیید + XP", callback_data=f"submission:approve:{sid}"),InlineKeyboardButton(text="❌ رد", callback_data=f"submission:reject:{sid}")]])
     for admin_uid in await admin_ids():
         try:
             if message.photo:
@@ -772,7 +694,6 @@ async def reward_review(call: CallbackQuery):
 
 async def main():
     await init_db()
-    await load_button_styles()
     print("Secret Society bot is running...")
     await dp.start_polling(bot)
 
