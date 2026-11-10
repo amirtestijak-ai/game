@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
+import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -74,6 +75,7 @@ class AdminFlow(StatesGroup):
     text_value = State()
     add_admin_id = State()
     mission_submission = State()
+    xp_price = State()
 
 async def is_admin(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -144,7 +146,8 @@ def admin_kb():
          styled_button("🎨 ادیت رنگ دکمه‌ها", "admin:colors")],
         [styled_button("🔗 تغییر لینک کانال", "admin:channellink"),
          styled_button("👑 مدیریت ادمین‌ها", "admin:admins")],
-        [styled_button("📊 آمار ربات", "admin:stats")],
+        [styled_button("💳 قیمت‌گذاری XP", "admin:xpprice"),
+         styled_button("📊 آمار ربات", "admin:stats")],
     ])
 
 def user_kb(user_is_admin=False):
@@ -157,6 +160,7 @@ def user_kb(user_is_admin=False):
          styled_button("🎁 درخواست جایزه", "user:reward")],
         [styled_button("🔗 دعوت دوستان", "user:referral"),
          styled_button("📖 راهنما", "user:guide")],
+        [styled_button("💳 خرید XP", "user:buyxp", style="success")],
     ]
     if user_is_admin:
         rows.append([styled_button("🛠 پنل مدیریت", "admin:openpanel", style="danger")])
@@ -322,6 +326,11 @@ async def init_db():
             created_at TEXT)""")
         await db.execute("CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        await db.execute("""CREATE TABLE IF NOT EXISTS xp_payments(
+            invoice_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, xp INTEGER NOT NULL,
+            amount INTEGER NOT NULL, final_amount INTEGER NOT NULL, payment_link TEXT NOT NULL,
+            mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+            transaction_id INTEGER, credited INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)""")
         await db.execute("CREATE TABLE IF NOT EXISTS referrals(invitee_id INTEGER PRIMARY KEY, inviter_id INTEGER, created_at TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS referral_bonus(user_id INTEGER PRIMARY KEY, awarded_at TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS daily_claims(user_id INTEGER, claim_date TEXT, PRIMARY KEY(user_id, claim_date))")
@@ -511,6 +520,10 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         reward_buttons = [[InlineKeyboardButton(text=f"درخواست #{rid} ✅", callback_data=f"reward:approve:{rid}"),
                            InlineKeyboardButton(text="❌ رد", callback_data=f"reward:reject:{rid}")] for rid, uid, created in rows]
         await edit_or_answer(call, reward_text[:4000], parse_mode="HTML", reply_markup=kb(reward_buttons))
+    elif action == "xpprice":
+        current = await get_setting("xp_price_per_100", "0")
+        await state.set_state(AdminFlow.xp_price)
+        await edit_or_answer(call, f"💳 قیمت هر ۱۰۰ XP رو به تومان بفرست. حداقل ۱۰٬۰۰۰ تومان است تا حداقل مبلغ درگاه رعایت شود.\n\nقیمت فعلی: {current} تومان", reply_markup=nav_kb())
     elif action == "xp":
         await state.set_state(AdminFlow.xp_user_id)
         await edit_or_answer(call, "🆔 آیدی عددی کاربر رو بفرست:", reply_markup=nav_kb())
@@ -696,6 +709,18 @@ async def xp_amount(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("⭐ XP کاربر به‌روزرسانی شد.", reply_markup=admin_kb())
 
+@dp.message(AdminFlow.xp_price)
+async def save_xp_price(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    try:
+        price = int((message.text or "").replace(",", "").replace("٬", "").strip())
+        if price < 10000 or price > 50000000: raise ValueError
+    except ValueError:
+        return await message.answer("🔢 مبلغ معتبر بفرست؛ حداقل ۱۰٬۰۰۰ و حداکثر ۵۰٬۰۰۰٬۰۰۰ تومان.", reply_markup=nav_kb())
+    await set_setting("xp_price_per_100", str(price))
+    await state.clear()
+    await message.answer(f"✅ قیمت ذخیره شد: هر ۱۰۰ XP برابر {price:,} تومان.", reply_markup=admin_kb())
+
 @dp.message(AdminFlow.announce_text)
 async def announcement(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
@@ -733,6 +758,51 @@ async def user_callbacks(call: CallbackQuery):
             [InlineKeyboardButton(text="✅ بررسی عضویت", callback_data="user:checkjoin", style="success")],
         ]))
     await ensure_user(call.from_user)
+    if action == "buyxp":
+        rate = int(await get_setting("xp_price_per_100", "0") or "0")
+        if rate < 10000:
+            return await edit_or_answer(call, "💳 خرید XP هنوز فعال نشده؛ مدیر باید اول قیمت هر ۱۰۰ XP رو از پنل مدیریت تنظیم کنه.", reply_markup=nav_kb())
+        return await edit_or_answer(call, f"⭐ <b>فروشگاه XP</b>\n\nقیمت هر ۱۰۰ XP: <b>{rate:,} تومان</b>\n\nبسته موردنظرت رو انتخاب کن:", parse_mode="HTML", reply_markup=kb([
+            [InlineKeyboardButton(text=f"⭐ ۱۰۰ XP | {rate:,} تومان", callback_data="user:buyxp:100", style="success")],
+            [InlineKeyboardButton(text=f"⭐ ۵۰۰ XP | {rate*5:,} تومان", callback_data="user:buyxp:500")],
+            [InlineKeyboardButton(text=f"⭐ ۱۰۰۰ XP | {rate*10:,} تومان", callback_data="user:buyxp:1000")],
+            [InlineKeyboardButton(text="⬅️ برگشت", callback_data="nav:back"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="nav:home")]
+        ]))
+    if action.startswith("buyxp:"):
+        try: pack = int(action.split(":", 1)[1])
+        except ValueError: return await edit_or_answer(call, "بسته نامعتبره.")
+        if pack not in (100, 500, 1000): return await edit_or_answer(call, "بسته نامعتبره.")
+        api_key = os.getenv("BLUPAL_API_KEY", "").strip()
+        if not api_key:
+            return await edit_or_answer(call, "⚠️ اتصال درگاه هنوز کامل تنظیم نشده؛ کلید API بلوپال روی سرور ثبت نشده.", reply_markup=nav_kb())
+        rate = int(await get_setting("xp_price_per_100", "0") or "0")
+        price_toman = rate * (pack // 100)
+        amount_rial = price_toman * 10
+        if amount_rial < 100000:
+            return await edit_or_answer(call, "حداقل مبلغ فاکتور بلوپال ۱۰۰٬۰۰۰ ریال است.", reply_markup=nav_kb())
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post("https://blupal.top/api/v1/invoices/create", headers={"X-API-Key": api_key, "Content-Type": "application/json"}, json={"amount": amount_rial}) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status != 200 or not data.get("success"):
+                        err = data.get("message") or data.get("error") or f"HTTP {resp.status}"
+                        return await edit_or_answer(call, f"❌ ساخت فاکتور انجام نشد: {str(err)[:180]}", reply_markup=nav_kb())
+            invoice_id = int(data["invoice_id"])
+            final_amount = int(data.get("final_amount", amount_rial))
+            payment_link = str(data["payment_link"])
+            mode = str(data.get("mode", "live"))
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT INTO xp_payments(invoice_id,user_id,xp,amount,final_amount,payment_link,mode,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (invoice_id, call.from_user.id, pack, amount_rial, final_amount, payment_link, mode, "PENDING", datetime.now(timezone.utc).isoformat()))
+                await db.commit()
+            await edit_or_answer(call, f"🧾 <b>فاکتور خرید XP ساخته شد</b>\n\n⭐ مقدار: <b>{pack} XP</b>\n💰 مبلغ پایه: <b>{price_toman:,} تومان</b>\n💳 مبلغ دقیق قابل پرداخت: <b>{final_amount:,} ریال</b>\n🆔 فاکتور: <code>{invoice_id}</code>\n\nبعد از پرداخت، روی «بررسی پرداخت» بزن تا وضعیت از خود درگاه بررسی بشه و XP فقط یک‌بار اضافه بشه.", parse_mode="HTML", reply_markup=kb([
+                [InlineKeyboardButton(text="💳 پرداخت فاکتور", url=payment_link, style="success")],
+                [InlineKeyboardButton(text="🔎 بررسی پرداخت", callback_data=f"payment:check:{invoice_id}")],
+                [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="nav:home")]
+            ]))
+        except Exception as exc:
+            print(f"BLUPAL CREATE ERROR uid={call.from_user.id}: {type(exc).__name__}: {exc}")
+            return await edit_or_answer(call, "❌ ارتباط با درگاه برقرار نشد. چند لحظه بعد دوباره تلاش کن.", reply_markup=nav_kb())
     if action == "home":
         greeting = await get_setting("welcome", TEXT_DEFAULTS["welcome"])
         return await edit_or_answer(call, greeting, reply_markup=user_kb(await is_admin(call.from_user.id)), parse_mode="HTML")
@@ -798,6 +868,57 @@ async def user_callbacks(call: CallbackQuery):
             rows = await (await db.execute("SELECT first_name,xp FROM users ORDER BY xp DESC LIMIT 10")).fetchall()
         text = "🏆 <b>Top Operatives</b>\n\n" + "\n".join(f"{i}. {name or 'Operative'} — {xp} XP" for i,(name,xp) in enumerate(rows,1))
         await edit_or_answer(call, text, parse_mode="HTML", reply_markup=nav_kb())
+
+@dp.callback_query(F.data.startswith("payment:check:"))
+async def check_xp_payment(call: CallbackQuery):
+    try:
+        invoice_id = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        return await call.answer("فاکتور نامعتبره.", show_alert=True)
+    api_key = os.getenv("BLUPAL_API_KEY", "").strip()
+    if not api_key:
+        return await call.answer("کلید درگاه تنظیم نشده.", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT user_id,xp,amount,final_amount,mode,status,credited FROM xp_payments WHERE invoice_id=?", (invoice_id,))).fetchone()
+    if not row:
+        return await call.answer("فاکتور پیدا نشد.", show_alert=True)
+    uid, xp, expected_amount, expected_final, saved_mode, old_status, credited = row
+    if uid != call.from_user.id:
+        return await call.answer("این فاکتور متعلق به حساب تو نیست.", show_alert=True)
+    if credited:
+        return await edit_or_answer(call, f"✅ این فاکتور قبلاً ثبت شده و {xp} XP به حسابت اضافه شده.", reply_markup=nav_kb())
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"https://blupal.top/api/v1/invoices/{invoice_id}", headers={"X-API-Key": api_key}) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status != 200 or not data.get("success"):
+                    return await call.answer("وضعیت فاکتور از درگاه دریافت نشد؛ دوباره تلاش کن.", show_alert=True)
+        status = str(data.get("status", "")).upper()
+        mode = str(data.get("mode", ""))
+        amount = int(data.get("amount") or 0)
+        final_amount = int(data.get("final_amount") or 0)
+        if status != "PAID":
+            await call.answer("هنوز پرداخت موفق از طرف درگاه ثبت نشده.", show_alert=True)
+            return
+        if mode != saved_mode or mode != "live" or amount != expected_amount or final_amount != expected_final:
+            return await call.answer("مغایرت اطلاعات فاکتور؛ XP اضافه نشد. با مدیر تماس بگیر.", show_alert=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            fresh = await (await db.execute("SELECT user_id,xp,credited FROM xp_payments WHERE invoice_id=?", (invoice_id,))).fetchone()
+            if not fresh or fresh[0] != call.from_user.id:
+                await db.rollback()
+                return await call.answer("فاکتور معتبر نیست.", show_alert=True)
+            if fresh[2]:
+                await db.commit()
+                return await edit_or_answer(call, f"✅ این فاکتور قبلاً ثبت شده و {fresh[1]} XP به حسابت اضافه شده.", reply_markup=nav_kb())
+            await db.execute("UPDATE users SET xp=xp+? WHERE user_id=?", (fresh[1], call.from_user.id))
+            await db.execute("UPDATE xp_payments SET status='PAID',transaction_id=?,credited=1 WHERE invoice_id=?", (data.get("transaction_id"), invoice_id))
+            await db.commit()
+        await edit_or_answer(call, f"🎉 پرداخت با موفقیت تأیید شد!\n⭐ {xp} XP به پرونده‌ات اضافه شد. 👻", reply_markup=nav_kb())
+    except Exception as exc:
+        print(f"BLUPAL CHECK ERROR invoice={invoice_id}: {type(exc).__name__}: {exc}")
+        return await call.answer("خطا در بررسی پرداخت؛ کمی بعد دوباره تلاش کن.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("mission:submit:"))
 async def mission_submit(call: CallbackQuery, state: FSMContext):
