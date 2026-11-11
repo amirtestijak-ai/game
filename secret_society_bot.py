@@ -83,6 +83,10 @@ class AdminFlow(StatesGroup):
     mission_edit_value = State()
     xp_price_100 = State()
     custom_xp_amount = State()
+    wallet_topup_amount = State()
+    wallet_custom_xp_amount = State()
+    wallet_admin_uid = State()
+    wallet_admin_amount = State()
 
 async def is_admin(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -155,6 +159,7 @@ def admin_kb():
          styled_button("👑 مدیریت ادمین‌ها", "admin:admins")],
         [styled_button("📊 آمار ربات", "admin:stats")],
         [styled_button("💰 قیمت‌گذاری خرید XP", "admin:xpprice", style="success")],
+        [styled_button("👛 مدیریت کیف پول‌ها", "admin:wallets")],
     ], navigation=False)
 
 def user_kb(user_is_admin=False):
@@ -168,6 +173,7 @@ def user_kb(user_is_admin=False):
         [styled_button("🔗 دعوت دوستان", "user:referral"),
          styled_button("📖 راهنما", "user:guide")],
         [styled_button("💳 خرید XP", "user:buyxp", style="success")],
+        [styled_button("👛 کیف پول من", "user:wallet", style="success")],
     ]
     if user_is_admin:
         rows.append([styled_button("🛠 پنل مدیریت", "admin:openpanel", style="danger")])
@@ -339,6 +345,19 @@ async def init_db():
             invoice_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, xp INTEGER NOT NULL,
             amount INTEGER NOT NULL, final_amount INTEGER, status TEXT NOT NULL DEFAULT 'PENDING',
             created_at TEXT NOT NULL, paid_at TEXT, transaction_id INTEGER)""")
+        # Wallet tables are additive: existing users, XP, missions and payment records remain intact.
+        await db.execute("""CREATE TABLE IF NOT EXISTS wallet_topups(
+            invoice_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount_toman INTEGER NOT NULL,
+            amount INTEGER NOT NULL, final_amount INTEGER, status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TEXT NOT NULL, paid_at TEXT, transaction_id INTEGER)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS wallet_transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
+            amount_toman INTEGER NOT NULL, balance_after INTEGER NOT NULL, reference TEXT UNIQUE,
+            description TEXT, created_at TEXT NOT NULL)""")
+        user_columns = {row[1] for row in await (await db.execute("PRAGMA table_info(users)")).fetchall()}
+        if "wallet_balance" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN wallet_balance INTEGER NOT NULL DEFAULT 0")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user ON wallet_transactions(user_id, id DESC)")
         await db.execute("CREATE TABLE IF NOT EXISTS daily_claims(user_id INTEGER, claim_date TEXT, PRIMARY KEY(user_id, claim_date))")
         await db.execute("CREATE TABLE IF NOT EXISTS mission_submissions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, mission_id INTEGER, answer TEXT, file_id TEXT, status TEXT DEFAULT 'pending', submitted_at TEXT)")
         await db.commit()
@@ -429,6 +448,8 @@ async def start(message: Message):
     greeting = await get_setting("welcome", TEXT_DEFAULTS["welcome"])
     # متن‌ها از پنل قابل تغییرند؛ خط‌های خالی اضافی نمایش داده نمی‌شوند.
     greeting = "\n".join(line.rstrip() for line in greeting.splitlines()).strip()
+    wallet_balance = await get_wallet_balance(message.from_user.id)
+    greeting += f"\n\n👛 <b>موجودی کیف پول:</b> {wallet_balance:,} تومان"
     await message.answer(greeting, reply_markup=user_kb(await is_admin(message.from_user.id)), parse_mode="HTML")
 
 @dp.message(Command("guide"))
@@ -467,6 +488,8 @@ async def navigation_callbacks(call: CallbackQuery, state: FSMContext):
     if action in {"home", "back"}:
         greeting = await get_setting("welcome", TEXT_DEFAULTS["welcome"])
         greeting = "\n".join(line.rstrip() for line in greeting.splitlines()).strip()
+        wallet_balance = await get_wallet_balance(call.from_user.id)
+        greeting += f"\n\n👛 <b>موجودی کیف پول:</b> {wallet_balance:,} تومان"
         return await edit_or_answer(
             call, greeting,
             reply_markup=user_kb(await is_admin(call.from_user.id)),
@@ -541,6 +564,11 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         reward_buttons = [[InlineKeyboardButton(text=f"درخواست #{rid} ✅", callback_data=f"reward:approve:{rid}"),
                            InlineKeyboardButton(text="❌ رد", callback_data=f"reward:reject:{rid}")] for rid, uid, created in rows]
         await edit_or_answer(call, reward_text[:4000], parse_mode="HTML", reply_markup=kb(reward_buttons))
+    elif action == "wallets":
+        if not await is_admin(call.from_user.id):
+            return await edit_or_answer(call, "⛔ دسترسی غیرمجاز.")
+        await state.set_state(AdminFlow.wallet_admin_uid)
+        await edit_or_answer(call, "👛 <b>مدیریت کیف پول</b>\n\nآیدی عددی کاربر رو بفرست:", parse_mode="HTML", reply_markup=nav_kb())
     elif action == "xpprice":
         current_price = await get_xp_price_100_toman()
         await state.set_state(AdminFlow.xp_price_100)
@@ -870,6 +898,7 @@ async def receive_custom_xp_amount(message: Message, state: FSMContext):
         markup = kb([
             [InlineKeyboardButton(text="💳 پرداخت فاکتور", url=payment_link, style="success")],
             [InlineKeyboardButton(text="🔄 بررسی پرداخت", callback_data=f"xp:check:{invoice_id}", style="primary")],
+            [InlineKeyboardButton(text="👛 پرداخت با موجودی کیف پول", callback_data=f"xp:walletbuy:{xp}", style="success")],
         ])
         await message.answer(
             f"🧾 <b>فاکتور خرید دلخواه XP</b>\n\n⭐ مقدار: <b>{xp:,} XP</b>\n"
@@ -928,6 +957,105 @@ async def get_xp_price_100_toman() -> int:
         return 0
 
 
+async def get_wallet_balance(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT wallet_balance FROM users WHERE user_id=?", (user_id,))).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+async def wallet_history_text(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            "SELECT kind,amount_toman,balance_after,description,created_at FROM wallet_transactions WHERE user_id=? ORDER BY id DESC LIMIT 10",
+            (user_id,)
+        )).fetchall()
+    if not rows:
+        return "هنوز تراکنشی برای کیف پولت ثبت نشده."
+    lines = []
+    for kind, amount, balance, description, created in rows:
+        sign = "+" if kind in ("credit", "topup", "admin_credit") else "−"
+        label = description or ("افزایش موجودی" if sign == "+" else "برداشت از کیف پول")
+        lines.append(f"{sign}{int(amount):,} تومان | موجودی: {int(balance):,} تومان\n{label}\n{str(created)[:16]}")
+    return "\n\n────────────\n\n".join(lines)
+
+
+async def credit_wallet(user_id: int, amount_toman: int, *, kind: str, reference: str, description: str) -> bool:
+    if amount_toman <= 0:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT wallet_balance FROM users WHERE user_id=?", (user_id,))).fetchone()
+        if not row:
+            await db.rollback()
+            return False
+        cur = await db.execute("UPDATE users SET wallet_balance=wallet_balance+? WHERE user_id=?", (amount_toman, user_id))
+        balance = int(row[0] or 0) + amount_toman
+        try:
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,kind,amount_toman,balance_after,reference,description,created_at) VALUES(?,?,?,?,?,?,?)",
+                (user_id, kind, amount_toman, balance, reference, description, now)
+            )
+        except aiosqlite.IntegrityError:
+            await db.rollback()
+            return False
+        await db.commit()
+    return True
+
+
+async def debit_wallet_for_xp(user_id: int, xp: int, amount_toman: int, reference: str) -> tuple[bool, int]:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT wallet_balance FROM users WHERE user_id=?", (user_id,))).fetchone()
+        if not row:
+            await db.rollback()
+            return False, 0
+        balance = int(row[0] or 0)
+        if balance < amount_toman:
+            await db.rollback()
+            return False, balance
+        try:
+            await db.execute("UPDATE users SET wallet_balance=wallet_balance-?, xp=xp+? WHERE user_id=?", (amount_toman, xp, user_id))
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,kind,amount_toman,balance_after,reference,description,created_at) VALUES(?,?,?,?,?,?,?)",
+                (user_id, "debit", amount_toman, balance-amount_toman, reference, f"خرید {xp:,} XP از کیف پول", now)
+            )
+        except aiosqlite.IntegrityError:
+            await db.rollback()
+            return False, balance
+        await db.commit()
+        return True, balance-amount_toman
+
+
+async def create_wallet_topup_invoice(user_id: int, amount_toman: int):
+    if not BLUPAL_API_KEY:
+        raise RuntimeError("BLUPAL_API_KEY تنظیم نشده است")
+    if amount_toman < 10_000 or amount_toman > 50_000_000:
+        raise ValueError("مبلغ شارژ باید بین ۱۰ هزار تا ۵۰ میلیون تومان باشد")
+    amount_irr = amount_toman * 10
+    timeout = ClientTimeout(total=20)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.post(
+            "https://blupal.top/api/v1/invoices/create",
+            headers={"X-API-Key": BLUPAL_API_KEY, "Content-Type": "application/json"},
+            json={"amount": amount_irr},
+        ) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400 or not data.get("success"):
+                raise RuntimeError(str(data.get("message") or data.get("error") or f"BluPal HTTP {response.status}"))
+    invoice_id = int(data["invoice_id"])
+    payment_link = str(data["payment_link"])
+    final_amount = int(data.get("final_amount") or amount_irr)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO wallet_topups(invoice_id,user_id,amount_toman,amount,final_amount,status,created_at) VALUES(?,?,?,?,?,'PENDING',?)",
+            (invoice_id, user_id, amount_toman, amount_irr, final_amount, datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+    return payment_link, final_amount // 10, invoice_id
+
+
 async def create_blupal_invoice(user_id: int, xp: int):
     """Create a BluPal invoice and persist it before showing the payment link."""
     if not BLUPAL_API_KEY:
@@ -962,7 +1090,7 @@ async def create_blupal_invoice(user_id: int, xp: int):
 
 
 async def confirm_blupal_invoice(invoice_id: int, webhook_payload: dict | None = None):
-    """Never trust webhook JSON alone: verify the invoice against BluPal's API."""
+    """Verify the invoice remotely, then credit either XP or the user's wallet once."""
     if not BLUPAL_API_KEY:
         raise RuntimeError("BLUPAL_API_KEY تنظیم نشده است")
     timeout = ClientTimeout(total=15)
@@ -978,13 +1106,16 @@ async def confirm_blupal_invoice(invoice_id: int, webhook_payload: dict | None =
         return False
     if str(remote.get("mode", "live")).lower() != "live":
         return False
+
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        row = await (await db.execute("SELECT * FROM xp_purchases WHERE invoice_id=?", (invoice_id,))).fetchone()
+        xp_row = await (await db.execute("SELECT * FROM xp_purchases WHERE invoice_id=?", (invoice_id,))).fetchone()
+        wallet_row = None if xp_row else await (await db.execute("SELECT * FROM wallet_topups WHERE invoice_id=?", (invoice_id,))).fetchone()
+        row = xp_row or wallet_row
         if not row:
             logging.warning("BluPal webhook for unknown invoice_id=%s", invoice_id)
             return False
-        # Match the paid amount to the exact invoice created for this user/order.
         if int(remote.get("amount") or -1) != int(row["amount"]):
             logging.error("BluPal amount mismatch invoice_id=%s", invoice_id)
             return False
@@ -993,17 +1124,42 @@ async def confirm_blupal_invoice(invoice_id: int, webhook_payload: dict | None =
             return False
         if row["status"] == "PAID":
             return True
-        cur = await db.execute(
-            "UPDATE xp_purchases SET status='PAID', paid_at=?, transaction_id=? WHERE invoice_id=? AND status='PENDING'",
-            (datetime.now(timezone.utc).isoformat(), remote.get("transaction_id"), invoice_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        await db.execute("UPDATE users SET xp=xp+? WHERE user_id=?", (row["xp"], row["user_id"]))
+        await db.execute("BEGIN IMMEDIATE")
+        if xp_row:
+            cur = await db.execute(
+                "UPDATE xp_purchases SET status='PAID', paid_at=?, transaction_id=? WHERE invoice_id=? AND status='PENDING'",
+                (now, remote.get("transaction_id"), invoice_id),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute("UPDATE users SET xp=xp+? WHERE user_id=?", (row["xp"], row["user_id"]))
+            notice = f"🎉 پرداختت تأیید شد!\n⭐ {int(row['xp']):,} XP به پرونده‌ات اضافه شد.\n🕯️ حالا می‌تونی به محفل برگردی."
+        else:
+            cur = await db.execute(
+                "UPDATE wallet_topups SET status='PAID', paid_at=?, transaction_id=? WHERE invoice_id=? AND status='PENDING'",
+                (now, remote.get("transaction_id"), invoice_id),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                return False
+            user_id = int(row["user_id"])
+            amount_toman = int(row["amount_toman"])
+            user_row = await (await db.execute("SELECT wallet_balance FROM users WHERE user_id=?", (user_id,))).fetchone()
+            if not user_row:
+                await db.rollback()
+                return False
+            balance = int(user_row[0] or 0) + amount_toman
+            await db.execute("UPDATE users SET wallet_balance=wallet_balance+? WHERE user_id=?", (amount_toman, user_id))
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,kind,amount_toman,balance_after,reference,description,created_at) VALUES(?,?,?,?,?,?,?)",
+                (user_id, "topup", amount_toman, balance, f"blupal_topup:{invoice_id}", "شارژ کیف پول با بلوپال", now)
+            )
+            notice = f"✅ شارژ کیف پولت تأیید شد!\n💰 مبلغ شارژ: {amount_toman:,} تومان\n👛 موجودی جدید: {balance:,} تومان"
         await db.commit()
-        user_id, xp = int(row["user_id"]), int(row["xp"])
+        user_id = int(row["user_id"])
     try:
-        await bot.send_message(user_id, f"🎉 پرداختت تأیید شد!\n⭐ {xp} XP به پرونده‌ات اضافه شد.\n🕯️ حالا می‌تونی به محفل برگردی.")
+        await bot.send_message(user_id, notice)
     except Exception:
         logging.exception("Could not notify user after paid invoice %s", invoice_id)
     return True
@@ -1070,6 +1226,8 @@ async def user_callbacks(call: CallbackQuery):
     await ensure_user(call.from_user)
     if action == "home":
         greeting = await get_setting("welcome", TEXT_DEFAULTS["welcome"])
+        wallet_balance = await get_wallet_balance(call.from_user.id)
+        greeting += f"\n\n👛 <b>موجودی کیف پول:</b> {wallet_balance:,} تومان"
         return await edit_or_answer(call, greeting, reply_markup=user_kb(await is_admin(call.from_user.id)), parse_mode="HTML")
     if action == "buyxp":
         price_100 = await get_xp_price_100_toman()
@@ -1081,6 +1239,16 @@ async def user_callbacks(call: CallbackQuery):
             [InlineKeyboardButton(text="💫 ۱۰۰۰ XP", callback_data="xp:buy:1000", style="primary")],
             [InlineKeyboardButton(text="✍️ خرید XP دلخواه", callback_data="xp:custom", style="success")],
         ]))
+    if action == "wallet":
+        balance = await get_wallet_balance(call.from_user.id)
+        await edit_or_answer(call,
+            f"👛 <b>کیف پول SECRET SOCIETY</b>\n\n💰 موجودی فعلی: <b>{balance:,} تومان</b>\n\nاز این بخش می‌تونی کیف پولت رو شارژ کنی، گردش حسابت رو ببینی یا موجودی رو برای خرید XP خرج کنی.",
+            parse_mode="HTML", reply_markup=kb([
+                [InlineKeyboardButton(text="➕ شارژ کیف پول", callback_data="wallet:topup", style="success")],
+                [InlineKeyboardButton(text="📜 تاریخچه تراکنش‌ها", callback_data="wallet:history")],
+                [InlineKeyboardButton(text="⭐ خرید XP با کیف پول", callback_data="wallet:buyxp", style="primary")],
+            ]))
+        return
     if action == "startgame":
         action = "missions"
     if action == "guide":
@@ -1091,7 +1259,8 @@ async def user_callbacks(call: CallbackQuery):
             row = await (await db.execute("SELECT xp FROM users WHERE user_id=?", (call.from_user.id,))).fetchone()
         xp = row[0] if row else 0
         rank, next_rank, next_xp, pct = rank_progress(xp)
-        text = f"🪪 <b>پرونده عضو</b>\nID: <code>{call.from_user.id}</code>\nXP: {xp}\nRank: <b>{rank}</b>"
+        wallet_balance = await get_wallet_balance(call.from_user.id)
+        text = f"🪪 <b>پرونده عضو</b>\nID: <code>{call.from_user.id}</code>\nXP: {xp}\n👛 کیف پول: {wallet_balance:,} تومان\nRank: <b>{rank}</b>"
         if next_rank: text += f"\nرتبه بعدی: {next_rank} ({next_xp} XP)\nپیشرفت: {pct}%"
         await edit_or_answer(call, text, parse_mode="HTML", reply_markup=nav_kb())
     elif action == "missions":
@@ -1174,6 +1343,7 @@ async def buy_xp_callback(call: CallbackQuery):
         markup = kb([
             [InlineKeyboardButton(text="💳 پرداخت فاکتور", url=payment_link, style="success")],
             [InlineKeyboardButton(text="🔄 بررسی پرداخت", callback_data=f"xp:check:{invoice_id}", style="primary")],
+            [InlineKeyboardButton(text="👛 پرداخت با موجودی کیف پول", callback_data=f"xp:walletbuy:{xp}", style="success")],
         ])
         await edit_or_answer(call, f"🧾 <b>فاکتور خرید XP</b>\n\n⭐ بسته: <b>{xp} XP</b>\n💰 مبلغ پایه: <b>{amount_toman:,} تومان</b>\n💳 مبلغ نهایی درگاه: <b>{final_toman:,} تومان</b>\n🆔 فاکتور: <code>{invoice_id}</code>\n\nبعد از پرداخت، دکمه بررسی پرداخت رو بزن. XP فقط بعد از تأیید سرور بلوپال اضافه می‌شه.", parse_mode="HTML", reply_markup=markup)
         await call.answer()
@@ -1200,6 +1370,199 @@ async def check_xp_payment_callback(call: CallbackQuery):
     except Exception:
         logging.exception("XP payment status check failed")
         await call.answer("بررسی پرداخت فعلاً ناموفق بود.", show_alert=True)
+
+
+@dp.callback_query(F.data == "wallet:topup")
+async def wallet_topup_start(call: CallbackQuery, state: FSMContext):
+    if not BLUPAL_API_KEY:
+        return await call.answer("درگاه پرداخت توسط مدیر تنظیم نشده.", show_alert=True)
+    await state.set_state(AdminFlow.wallet_topup_amount)
+    await call.answer()
+    await edit_or_answer(call,
+        "➕ <b>شارژ کیف پول</b>\n\nمبلغ شارژ رو به تومان بفرست.\nحداقل: ۱۰٬۰۰۰ تومان\nحداکثر: ۵۰٬۰۰۰٬۰۰۰ تومان",
+        parse_mode="HTML", reply_markup=nav_kb())
+
+
+@dp.message(AdminFlow.wallet_topup_amount)
+async def wallet_topup_amount_message(message: Message, state: FSMContext):
+    raw = (message.text or "").replace(",", "").replace("٬", "").replace("تومان", "").strip()
+    if not raw.isdigit() or not 10_000 <= int(raw) <= 50_000_000:
+        return await message.answer("❌ مبلغ معتبر نیست. مبلغی بین ۱۰٬۰۰۰ تا ۵۰٬۰۰۰٬۰۰۰ تومان بفرست:", reply_markup=nav_kb())
+    amount = int(raw)
+    await state.clear()
+    try:
+        await ensure_user(message.from_user)
+        payment_link, final_toman, invoice_id = await create_wallet_topup_invoice(message.from_user.id, amount)
+        await message.answer(
+            f"🧾 <b>فاکتور شارژ کیف پول</b>\n\n💰 مبلغ شارژ: <b>{amount:,} تومان</b>\n💳 مبلغ نهایی درگاه: <b>{final_toman:,} تومان</b>\n🆔 فاکتور: <code>{invoice_id}</code>\n\nبعد از پرداخت، دکمه بررسی رو بزن. موجودی فقط پس از تأیید سرور بلوپال افزایش پیدا می‌کنه.",
+            parse_mode="HTML", reply_markup=kb([
+                [InlineKeyboardButton(text="💳 پرداخت فاکتور", url=payment_link, style="success")],
+                [InlineKeyboardButton(text="🔄 بررسی شارژ", callback_data=f"wallet:check:{invoice_id}", style="primary")],
+            ]))
+    except Exception:
+        logging.exception("Wallet topup invoice creation failed")
+        await message.answer("❌ ساخت فاکتور شارژ ناموفق بود؛ تنظیمات درگاه رو بررسی کن.", reply_markup=nav_kb())
+
+
+@dp.callback_query(F.data.startswith("wallet:check:"))
+async def wallet_topup_check(call: CallbackQuery):
+    try:
+        invoice_id = int(call.data.rsplit(":", 1)[1])
+        async with aiosqlite.connect(DB_PATH) as db:
+            row = await (await db.execute("SELECT user_id,status FROM wallet_topups WHERE invoice_id=?", (invoice_id,))).fetchone()
+        if not row or int(row[0]) != call.from_user.id:
+            return await call.answer("این فاکتور متعلق به حساب تو نیست.", show_alert=True)
+        if row[1] == "PAID":
+            balance = await get_wallet_balance(call.from_user.id)
+            return await edit_or_answer(call, f"✅ این شارژ قبلاً ثبت شده.\n👛 موجودی فعلی: {balance:,} تومان", reply_markup=nav_kb())
+        paid = await confirm_blupal_invoice(invoice_id)
+        if paid:
+            balance = await get_wallet_balance(call.from_user.id)
+            await call.answer("شارژ با موفقیت تأیید شد!", show_alert=True)
+            return await edit_or_answer(call, f"🎉 کیف پولت شارژ شد!\n👛 موجودی فعلی: {balance:,} تومان", reply_markup=nav_kb())
+        await call.answer("پرداخت هنوز تأیید نشده؛ کمی بعد دوباره بررسی کن.", show_alert=True)
+    except Exception:
+        logging.exception("Wallet topup check failed")
+        await call.answer("بررسی شارژ فعلاً ناموفق بود.", show_alert=True)
+
+
+@dp.callback_query(F.data == "wallet:history")
+async def wallet_history_callback(call: CallbackQuery):
+    balance = await get_wallet_balance(call.from_user.id)
+    history = await wallet_history_text(call.from_user.id)
+    await call.answer()
+    await edit_or_answer(call, f"📜 <b>تاریخچه کیف پول</b>\n\n👛 موجودی: <b>{balance:,} تومان</b>\n\n{history}", parse_mode="HTML", reply_markup=nav_kb())
+
+
+@dp.callback_query(F.data == "wallet:customxp")
+async def wallet_custom_xp_start(call: CallbackQuery, state: FSMContext):
+    if await get_xp_price_100_toman() <= 0:
+        return await call.answer("قیمت XP هنوز توسط مدیر تنظیم نشده.", show_alert=True)
+    await state.set_state(AdminFlow.wallet_custom_xp_amount)
+    await call.answer()
+    await edit_or_answer(call, "✍️ مقدار دلخواه XP رو بفرست. حداقل ۱۰۱ و حداکثر ۱٬۰۰۰٬۰۰۰ XP. مبلغ از کیف پولت کسر می‌شه.", reply_markup=nav_kb())
+
+
+@dp.message(AdminFlow.wallet_custom_xp_amount)
+async def wallet_custom_xp_amount_message(message: Message, state: FSMContext):
+    raw = (message.text or "").replace(",", "").replace("٬", "").strip()
+    if not raw.isdigit() or not 101 <= int(raw) <= 1_000_000:
+        return await message.answer("تعداد XP باید بین ۱۰۱ تا ۱٬۰۰۰٬۰۰۰ باشه. دوباره بفرست:", reply_markup=nav_kb())
+    xp = int(raw)
+    price_100 = await get_xp_price_100_toman()
+    if price_100 <= 0:
+        await state.clear()
+        return await message.answer("قیمت XP هنوز توسط مدیر تنظیم نشده.", reply_markup=nav_kb())
+    amount = (xp * price_100 + 99) // 100
+    await ensure_user(message.from_user)
+    ok, balance = await debit_wallet_for_xp(message.from_user.id, xp, amount, f"xp_wallet_custom:{message.from_user.id}:{message.message_id}")
+    await state.clear()
+    if not ok:
+        return await message.answer(f"موجودی کافی نیست.\n💰 مبلغ خرید: {amount:,} تومان\n👛 موجودی فعلی: {balance:,} تومان\n\nاول کیف پولت رو شارژ کن.", reply_markup=nav_kb())
+    await message.answer(f"🎉 خرید XP با کیف پول موفق بود!\n⭐ XP اضافه‌شده: {xp:,}\n💸 مبلغ کسرشده: {amount:,} تومان\n👛 موجودی باقی‌مانده: {balance:,} تومان", reply_markup=nav_kb())
+
+
+@dp.callback_query(F.data == "wallet:buyxp")
+async def wallet_buy_xp_menu(call: CallbackQuery):
+    price = await get_xp_price_100_toman()
+    balance = await get_wallet_balance(call.from_user.id)
+    if price <= 0:
+        return await call.answer("قیمت خرید XP هنوز توسط مدیر تنظیم نشده.", show_alert=True)
+    await call.answer()
+    await edit_or_answer(call,
+        f"⭐ <b>خرید XP با کیف پول</b>\n\n👛 موجودی: <b>{balance:,} تومان</b>\n💰 هر ۱۰۰ XP: <b>{price:,} تومان</b>\n\nبسته رو انتخاب کن:",
+        parse_mode="HTML", reply_markup=kb([
+            [InlineKeyboardButton(text="⭐ ۱۰۰ XP", callback_data="xp:walletbuy:100", style="success")],
+            [InlineKeyboardButton(text="🌟 ۵۰۰ XP", callback_data="xp:walletbuy:500")],
+            [InlineKeyboardButton(text="💫 ۱۰۰۰ XP", callback_data="xp:walletbuy:1000")],
+            [InlineKeyboardButton(text="✍️ مقدار دلخواه", callback_data="wallet:customxp")],
+        ]))
+
+
+@dp.callback_query(F.data.startswith("xp:walletbuy:"))
+async def xp_wallet_purchase(call: CallbackQuery):
+    try:
+        xp = int(call.data.rsplit(":", 1)[1])
+        if xp not in {100, 500, 1000} and not (101 <= xp <= 1_000_000):
+            return await call.answer("مقدار XP نامعتبره.", show_alert=True)
+        price_100 = await get_xp_price_100_toman()
+        if price_100 <= 0:
+            return await call.answer("قیمت XP هنوز توسط مدیر تنظیم نشده.", show_alert=True)
+        amount = (xp * price_100 + 99) // 100
+        ok, balance = await debit_wallet_for_xp(call.from_user.id, xp, amount, f"xp_wallet:{call.from_user.id}:{call.id}")
+        if not ok:
+            return await call.answer(f"موجودی کافی نیست. مبلغ خرید {amount:,} تومان؛ موجودی فعلی {balance:,} تومان.", show_alert=True)
+        await call.answer("خرید موفق بود!", show_alert=True)
+        await edit_or_answer(call,
+            f"🎉 <b>خرید XP با کیف پول موفق بود!</b>\n\n⭐ XP اضافه‌شده: <b>{xp:,}</b>\n💸 مبلغ کسرشده: <b>{amount:,} تومان</b>\n👛 موجودی باقی‌مانده: <b>{balance:,} تومان</b>",
+            parse_mode="HTML", reply_markup=nav_kb())
+    except Exception:
+        logging.exception("Wallet XP purchase failed")
+        await call.answer("خرید با کیف پول ناموفق بود.", show_alert=True)
+
+
+@dp.callback_query(F.data == "admin:wallets")
+async def admin_wallets_open(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("دسترسی غیرمجاز", show_alert=True)
+    await state.set_state(AdminFlow.wallet_admin_uid)
+    await call.answer()
+    await edit_or_answer(call, "👛 <b>مدیریت کیف پول</b>\n\nآیدی عددی کاربر رو بفرست تا موجودی‌اش رو ببینی یا تغییر بدی:", parse_mode="HTML", reply_markup=nav_kb())
+
+
+@dp.message(AdminFlow.wallet_admin_uid)
+async def admin_wallet_uid_message(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        return await message.answer("آیدی باید عددی باشه؛ دوباره بفرست:", reply_markup=nav_kb())
+    uid = int(raw)
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT wallet_balance FROM users WHERE user_id=?", (uid,))).fetchone()
+    if not row:
+        return await message.answer("این کاربر هنوز در ربات ثبت نشده.", reply_markup=admin_kb())
+    await state.update_data(wallet_admin_uid=uid)
+    await state.set_state(AdminFlow.wallet_admin_amount)
+    await message.answer(f"👤 کاربر: <code>{uid}</code>\n👛 موجودی فعلی: <b>{int(row[0] or 0):,} تومان</b>\n\nبرای افزایش موجودی عدد مثبت و برای کاهش موجودی عدد منفی بفرست. مثال: 50000 یا -20000", parse_mode="HTML", reply_markup=nav_kb())
+
+
+@dp.message(AdminFlow.wallet_admin_amount)
+async def admin_wallet_amount_message(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").replace(",", "").replace("٬", "").strip()
+    try:
+        delta = int(raw)
+    except ValueError:
+        return await message.answer("مبلغ رو به‌صورت عدد صحیح بفرست؛ برای کسر از علامت منفی استفاده کن.", reply_markup=nav_kb())
+    if delta == 0 or abs(delta) > 50_000_000:
+        return await message.answer("مبلغ باید غیرصفر و حداکثر ۵۰ میلیون تومان باشه.", reply_markup=nav_kb())
+    data = await state.get_data()
+    uid = int(data["wallet_admin_uid"])
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT wallet_balance FROM users WHERE user_id=?", (uid,))).fetchone()
+        if not row:
+            await db.rollback()
+            await state.clear()
+            return await message.answer("کاربر پیدا نشد.", reply_markup=admin_kb())
+        before = int(row[0] or 0)
+        if before + delta < 0:
+            await db.rollback()
+            return await message.answer(f"موجودی کافی نیست؛ موجودی فعلی {before:,} تومان است.", reply_markup=nav_kb())
+        after = before + delta
+        await db.execute("UPDATE users SET wallet_balance=? WHERE user_id=?", (after, uid))
+        await db.execute("INSERT INTO wallet_transactions(user_id,kind,amount_toman,balance_after,reference,description,created_at) VALUES(?,?,?,?,?,?,?)",
+            (uid, "admin_credit" if delta > 0 else "admin_debit", abs(delta), after, f"admin:{message.from_user.id}:{message.message_id}", f"تغییر موجودی توسط مدیر {message.from_user.id}", now))
+        await db.commit()
+    await state.clear()
+    await message.answer(f"✅ موجودی کیف پول کاربر به‌روزرسانی شد.\n👤 کاربر: {uid}\n👛 موجودی جدید: {after:,} تومان", reply_markup=admin_kb())
+    try:
+        await bot.send_message(uid, f"👛 موجودی کیف پولت توسط مدیریت تغییر کرد.\nتغییر: {'+' if delta > 0 else '−'}{abs(delta):,} تومان\nموجودی جدید: {after:,} تومان")
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data.startswith("mission:submit:"))
