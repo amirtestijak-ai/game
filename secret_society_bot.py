@@ -81,6 +81,8 @@ class AdminFlow(StatesGroup):
     add_admin_id = State()
     mission_submission = State()
     mission_edit_value = State()
+    xp_price_100 = State()
+    custom_xp_amount = State()
 
 async def is_admin(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -152,7 +154,8 @@ def admin_kb():
         [styled_button("🔗 تغییر لینک کانال", "admin:channellink"),
          styled_button("👑 مدیریت ادمین‌ها", "admin:admins")],
         [styled_button("📊 آمار ربات", "admin:stats")],
-    ])
+        [styled_button("💰 قیمت‌گذاری خرید XP", "admin:xpprice", style="success")],
+    ], navigation=False)
 
 def user_kb(user_is_admin=False):
     rows = [
@@ -168,7 +171,7 @@ def user_kb(user_is_admin=False):
     ]
     if user_is_admin:
         rows.append([styled_button("🛠 پنل مدیریت", "admin:openpanel", style="danger")])
-    return kb(rows)
+    return kb(rows, navigation=False)
 
 TEXT_DEFAULTS = {
     "welcome": (
@@ -538,6 +541,16 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         reward_buttons = [[InlineKeyboardButton(text=f"درخواست #{rid} ✅", callback_data=f"reward:approve:{rid}"),
                            InlineKeyboardButton(text="❌ رد", callback_data=f"reward:reject:{rid}")] for rid, uid, created in rows]
         await edit_or_answer(call, reward_text[:4000], parse_mode="HTML", reply_markup=kb(reward_buttons))
+    elif action == "xpprice":
+        current_price = await get_xp_price_100_toman()
+        await state.set_state(AdminFlow.xp_price_100)
+        await edit_or_answer(
+            call,
+            "💰 <b>قیمت‌گذاری خرید XP</b>\n\n"
+            f"قیمت فعلی هر ۱۰۰ XP: <b>{current_price:,} تومان</b>\n\n"
+            "قیمت جدید هر ۱۰۰ XP رو فقط به تومان و به‌صورت عدد بفرست:",
+            parse_mode="HTML", reply_markup=nav_kb()
+        )
     elif action == "xp":
         await state.set_state(AdminFlow.xp_user_id)
         await edit_or_answer(call, "🆔 آیدی عددی کاربر رو بفرست:", reply_markup=nav_kb())
@@ -825,6 +838,50 @@ async def mission_xp(message: Message, state: FSMContext):
     await message.answer(f"✅ مأموریت #{mission_id} ساخته شد و تصویر پرونده‌ای آن تولید شد.\nXP: {xp}",
                          reply_markup=admin_kb())
 
+@dp.message(AdminFlow.xp_price_100)
+async def save_xp_price_100(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").replace(",", "").replace("٬", "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return await message.answer("❌ قیمت معتبر نیست. یک عدد مثبت به تومان بفرست:", reply_markup=nav_kb())
+    price = int(raw)
+    if price * 10 < 100000:
+        return await message.answer("❌ با این قیمت، مبلغ خرید حداقل درگاه تأمین نمی‌شه. قیمت هر ۱۰۰ XP باید حداقل ۱۰٬۰۰۰ تومان باشه.", reply_markup=nav_kb())
+    await set_setting("xp_price_100_toman", str(price))
+    await state.clear()
+    await message.answer(f"✅ قیمت خرید XP ذخیره شد.\n💰 هر ۱۰۰ XP = {price:,} تومان\n\nخرید بسته‌ای و خرید دلخواه از این به بعد با همین نرخ محاسبه می‌شن.", reply_markup=admin_kb())
+
+
+@dp.message(AdminFlow.custom_xp_amount)
+async def receive_custom_xp_amount(message: Message, state: FSMContext):
+    raw = (message.text or "").replace(",", "").replace("٬", "").strip()
+    if not raw.isdigit() or int(raw) <= 100 or int(raw) > 1_000_000:
+        return await message.answer("⭐ تعداد XP باید عددی بیشتر از ۱۰۰ و حداکثر ۱٬۰۰۰٬۰۰۰ باشه. دوباره بفرست:", reply_markup=nav_kb())
+    xp = int(raw)
+    price_100 = await get_xp_price_100_toman()
+    if not BLUPAL_API_KEY or price_100 <= 0:
+        await state.clear()
+        return await message.answer("⚠️ درگاه یا قیمت خرید XP هنوز توسط مدیر تنظیم نشده.", reply_markup=nav_kb())
+    await state.clear()
+    try:
+        await ensure_user(message.from_user)
+        payment_link, amount_toman, final_toman, invoice_id = await create_blupal_invoice(message.from_user.id, xp)
+        markup = kb([
+            [InlineKeyboardButton(text="💳 پرداخت فاکتور", url=payment_link, style="success")],
+            [InlineKeyboardButton(text="🔄 بررسی پرداخت", callback_data=f"xp:check:{invoice_id}", style="primary")],
+        ])
+        await message.answer(
+            f"🧾 <b>فاکتور خرید دلخواه XP</b>\n\n⭐ مقدار: <b>{xp:,} XP</b>\n"
+            f"💰 مبلغ پایه: <b>{amount_toman:,} تومان</b>\n💳 مبلغ نهایی درگاه: <b>{final_toman:,} تومان</b>\n"
+            f"🆔 فاکتور: <code>{invoice_id}</code>\n\nبعد از پرداخت، دکمه بررسی پرداخت رو بزن.",
+            parse_mode="HTML", reply_markup=markup
+        )
+    except Exception:
+        logging.exception("Custom XP invoice creation failed")
+        await message.answer("❌ ساخت فاکتور ناموفق بود؛ تنظیمات درگاه رو بررسی کن.", reply_markup=nav_kb())
+
+
 @dp.message(AdminFlow.xp_user_id)
 async def xp_user(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
@@ -862,13 +919,23 @@ async def announcement(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"اطلاعیه برای {sent} کاربر ارسال شد.", reply_markup=admin_kb())
 
+async def get_xp_price_100_toman() -> int:
+    """Read XP price from admin settings; environment variable is fallback."""
+    try:
+        value = await get_setting("xp_price_100_toman", str(XP_PRICE_100_TOMAN))
+        return max(0, int(str(value).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
 async def create_blupal_invoice(user_id: int, xp: int):
     """Create a BluPal invoice and persist it before showing the payment link."""
     if not BLUPAL_API_KEY:
         raise RuntimeError("BLUPAL_API_KEY تنظیم نشده است")
-    if XP_PRICE_100_TOMAN <= 0:
-        raise RuntimeError("XP_PRICE_100_TOMAN باید در متغیرهای محیطی هاست تنظیم شود")
-    amount_toman = (xp // 100) * XP_PRICE_100_TOMAN
+    price_100 = await get_xp_price_100_toman()
+    if price_100 <= 0:
+        raise RuntimeError("قیمت هر ۱۰۰ XP هنوز توسط مدیر تنظیم نشده است")
+    amount_toman = (xp * price_100 + 99) // 100
     amount_irr = amount_toman * 10
     if amount_irr < 100000 or amount_irr > 500000000:
         raise ValueError("مبلغ خرید باید بین ۱۰ هزار تا ۵۰ میلیون تومان باشد")
@@ -1005,12 +1072,14 @@ async def user_callbacks(call: CallbackQuery):
         greeting = await get_setting("welcome", TEXT_DEFAULTS["welcome"])
         return await edit_or_answer(call, greeting, reply_markup=user_kb(await is_admin(call.from_user.id)), parse_mode="HTML")
     if action == "buyxp":
-        if not BLUPAL_API_KEY or XP_PRICE_100_TOMAN <= 0:
-            return await edit_or_answer(call, "⚠️ خرید XP هنوز توسط مدیر تنظیم نشده است.", reply_markup=nav_kb())
-        return await edit_or_answer(call, "💳 <b>خرید XP</b>\n\nبسته موردنظرت رو انتخاب کن:", parse_mode="HTML", reply_markup=kb([
+        price_100 = await get_xp_price_100_toman()
+        if not BLUPAL_API_KEY or price_100 <= 0:
+            return await edit_or_answer(call, "⚠️ خرید XP هنوز توسط مدیر تنظیم نشده است. مدیر باید از پنل مدیریت، قیمت هر ۱۰۰ XP رو ثبت کنه.", reply_markup=nav_kb())
+        return await edit_or_answer(call, f"💳 <b>خرید XP</b>\n\n💰 قیمت هر ۱۰۰ XP: <b>{price_100:,} تومان</b>\n\nبسته موردنظرت رو انتخاب کن یا مقدار دلخواهت رو وارد کن:", parse_mode="HTML", reply_markup=kb([
             [InlineKeyboardButton(text="⭐ ۱۰۰ XP", callback_data="xp:buy:100", style="success")],
             [InlineKeyboardButton(text="🌟 ۵۰۰ XP", callback_data="xp:buy:500", style="primary")],
             [InlineKeyboardButton(text="💫 ۱۰۰۰ XP", callback_data="xp:buy:1000", style="primary")],
+            [InlineKeyboardButton(text="✍️ خرید XP دلخواه", callback_data="xp:custom", style="success")],
         ]))
     if action == "startgame":
         action = "missions"
@@ -1075,12 +1144,29 @@ async def user_callbacks(call: CallbackQuery):
         text = "🏆 <b>Top Operatives</b>\n\n" + "\n".join(f"{i}. {name or 'Operative'} — {xp} XP" for i,(name,xp) in enumerate(rows,1))
         await edit_or_answer(call, text, parse_mode="HTML", reply_markup=nav_kb())
 
+@dp.callback_query(F.data == "xp:custom")
+async def custom_xp_start_callback(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id) and not await membership_ok(call.from_user.id):
+        return await call.answer("اول عضویت کانال رو بررسی کن.", show_alert=True)
+    if not BLUPAL_API_KEY or await get_xp_price_100_toman() <= 0:
+        return await call.answer("درگاه یا قیمت XP هنوز تنظیم نشده.", show_alert=True)
+    await state.set_state(AdminFlow.custom_xp_amount)
+    await call.answer()
+    await edit_or_answer(
+        call,
+        "✍️ <b>مقدار دلخواه XP</b>\n\nتعداد XP موردنظرت رو به‌صورت عدد بفرست.\n⭐ حداقل: ۱۰۱ XP\n⭐ حداکثر: ۱٬۰۰۰٬۰۰۰ XP\n\nمبلغ فاکتور بر اساس قیمت هر ۱۰۰ XP محاسبه می‌شه.",
+        parse_mode="HTML", reply_markup=nav_kb()
+    )
+
+
 @dp.callback_query(F.data.startswith("xp:buy:"))
 async def buy_xp_callback(call: CallbackQuery):
     try:
         xp = int(call.data.rsplit(":", 1)[1])
         if xp not in {100, 500, 1000}:
             return await call.answer("بسته نامعتبر است.", show_alert=True)
+        if not BLUPAL_API_KEY or await get_xp_price_100_toman() <= 0:
+            return await call.answer("قیمت XP یا کلید درگاه تنظیم نشده.", show_alert=True)
         if not await is_admin(call.from_user.id) and not await membership_ok(call.from_user.id):
             return await call.answer("اول عضویت کانال رو بررسی کن.", show_alert=True)
         await ensure_user(call.from_user)
