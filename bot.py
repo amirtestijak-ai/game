@@ -68,6 +68,23 @@ SOURCES = [
         "id": "iranintl", "name": "Iran International",
         "url": "https://www.iranintl.com/en/feed", "category": "iran",
     },
+    # Extra discovery feeds ensure Iran International stories are not missed
+    # when its general RSS feed is busy with other subjects.
+    {
+        "id": "iranintl_all", "name": "Iran International — همه خبرها",
+        "url": "https://news.google.com/rss/search?q=site%3Airanintl.com%2Fen%2F&hl=en-US&gl=US&ceid=US:en",
+        "category": "iran",
+    },
+    {
+        "id": "iranintl_protests", "name": "Iran International — اعتراضات ایران",
+        "url": "https://news.google.com/rss/search?q=site%3Airanintl.com+Iran+%28protest+OR+protests+OR+demonstration+OR+strike+OR+unrest%29&hl=en-US&gl=US&ceid=US:en",
+        "category": "iran",
+    },
+    {
+        "id": "iranintl_protesters", "name": "Iran International — معترضان و اعتصاب‌ها",
+        "url": "https://news.google.com/rss/search?q=site%3Airanintl.com+%28Iranian+protesters+OR+Iran+strike+OR+student+protest+OR+workers+protest+OR+teachers+protest%29&hl=en-US&gl=US&ceid=US:en",
+        "category": "iran",
+    },
     {
         "id": "iranwire", "name": "IranWire",
         "url": "https://iranwire.com/en/feed/", "category": "iran",
@@ -116,6 +133,21 @@ IRAN_TERMS = (
     "iran", "iranian", "tehran", "persian gulf", "islamic republic",
     "ایران", "تهران", "ایرانی", "فارس", "خلیج فارس",
 )
+
+# Protest-related coverage is deliberately prioritized over other Iran news.
+PROTEST_TERMS = (
+    "protest", "protests", "protester", "protesters", "demonstration",
+    "demonstrations", "strike", "strikes", "walkout", "unrest", "rally",
+    "retirees", "workers protest", "student protest", "teachers protest",
+    "اعتراض", "اعتراضات", "اعتراضی", "معترض", "معترضان", "تجمع",
+    "تجمعات", "اعتصاب", "اعتصابات", "اعتصابی", "بازنشستگان",
+    "دانشجویان", "کارگران", "فرهنگیان", "کسبه",
+)
+
+
+def is_protest_item(item):
+    text = (item.get("title", "") + " " + item.get("summary", "")).casefold()
+    return any(term.casefold() in text for term in PROTEST_TERMS)
 
 class AdminFlow(StatesGroup):
     channel = State()
@@ -215,6 +247,10 @@ async def init_db():
     for key, value in defaults.items():
         if await get_setting(key, "") == "":
             await set_setting(key, value)
+    # Earlier builds could leave this switch disabled in the persistent database.
+    # Re-enable once on startup so existing deployments resume photo posts.
+    if await get_setting("post_images", "1") != "1":
+        await set_setting("post_images", "1")
     for source in SOURCES:
         if await get_setting("source_" + source["id"], "") == "":
             await set_setting("source_" + source["id"], "1")
@@ -240,21 +276,27 @@ def clean_html(value: str) -> str:
 
 
 def extract_image(entry):
-    for item in entry.get("media_content", []) or []:
-        url = item.get("url")
+    # RSS feeds expose images in several incompatible places.
+    candidates = []
+    candidates.extend(entry.get("media_content", []) or [])
+    candidates.extend(entry.get("media_thumbnail", []) or [])
+    candidates.extend(entry.get("enclosures", []) or [])
+    for group in entry.get("media_groups", []) or []:
+        candidates.extend(group.get("contents", []) or [])
+        candidates.extend(group.get("thumbnails", []) or [])
+    for item in candidates:
+        url = item.get("url") or item.get("href")
         kind = (item.get("type") or "").lower()
         medium = (item.get("medium") or "").lower()
         if url and url.startswith("https://") and (kind.startswith("image/") or medium == "image" or not kind and not medium):
             return url
-    for item in entry.get("media_thumbnail", []) or []:
-        url = item.get("url")
-        if url and url.startswith("https://"):
-            return url
-    for item in entry.get("enclosures", []) or []:
-        url = item.get("href") or item.get("url")
-        kind = (item.get("type") or "").lower()
-        if url and url.startswith("https://") and kind.startswith("image/"):
-            return url
+    # Some publishers put the image only inside the HTML description/content.
+    html_fields = [entry.get("summary", "")]
+    html_fields.extend(x.get("value", "") for x in (entry.get("content", []) or []))
+    for fragment in html_fields:
+        match = re.search(r"<img\b[^>]*?src=[\"\'](https?://[^\"\']+)[\"\']", str(fragment or ""), re.I)
+        if match:
+            return html.unescape(match.group(1))
     return None
 
 
@@ -364,6 +406,23 @@ async def translate_with_openai(text: str) -> str:
     return result
 
 
+async def translate_with_mymemory(text: str) -> str:
+    """Secondary no-key translation provider used when Google is rate-limited."""
+    timeout = aiohttp.ClientTimeout(total=25)
+    params = {"q": text[:450], "langpair": "en|fa"}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get("https://api.mymemory.translated.net/get", params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+    if data.get("responseStatus") != 200:
+        raise RuntimeError("MyMemory translation unavailable")
+    result = (data.get("responseData") or {}).get("translatedText", "").strip()
+    result = html.unescape(result)
+    if not result or result.lower() == text.lower():
+        raise RuntimeError("MyMemory returned no translation")
+    return result
+
+
 async def translate_text(text: str) -> str:
     global TRANSLATION_LAST_CALL
     text = (text or "").strip()
@@ -424,6 +483,13 @@ async def translate_text(text: str) -> str:
                 last_error = exc
                 if attempt < 3 and not (isinstance(exc, RuntimeError) and "HTTP 429" in str(exc)):
                     await asyncio.sleep(min(20, 2 ** (attempt + 1)))
+        # Last no-key fallback. MyMemory has smaller limits, so keep requests short.
+        try:
+            translated = await translate_with_mymemory(text[:450])
+            await save_translation(text, translated)
+            return translated
+        except Exception as exc:
+            log.warning("MyMemory translation fallback failed: %s", str(exc)[:140])
         raise RuntimeError(f"Translation unavailable: {last_error}")
 
 
@@ -587,8 +653,19 @@ async def poll_once():
                 item["category"] = classify_item(item)
                 candidates.append(item)
 
-    candidates.sort(key=lambda x: x["timestamp"])
-    iran_items = [x for x in candidates if x["category"] == "iran"]
+    # The same story can appear in the official RSS and several discovery feeds.
+    # Deduplicate by canonical article URL before selecting posts.
+    unique = {}
+    for item in candidates:
+        canonical = item["link"].split("?", 1)[0].rstrip("/")
+        if canonical not in unique or item["source_id"] == "iranintl":
+            unique[canonical] = item
+    candidates = list(unique.values())
+
+    # Newest items first; within Iran coverage, protests and strikes come first.
+    candidates.sort(key=lambda x: x["timestamp"], reverse=True)
+    protest_items = [x for x in candidates if is_protest_item(x)]
+    iran_items = [x for x in candidates if x["category"] == "iran" and not is_protest_item(x)]
     world_items = [x for x in candidates if x["category"] == "world"]
 
     iran_count, world_count, total_count = await current_ratio_counts()
@@ -596,14 +673,17 @@ async def poll_once():
     iran_target = int(await get_setting("iran_percent", "80"))
     world_target = 100 - iran_target
 
-    # Prefer Iran news until the rolling share reaches the configured target.
-    # World news is held back while its rolling share is above its target.
-    chosen = iran_items[:MAX_POSTS_PER_CYCLE]
+    # Protest coverage overrides the normal Iran/world quota. Then other Iran
+    # International and Iran stories are preferred; world stories fill spare slots.
+    chosen = protest_items[:MAX_POSTS_PER_CYCLE]
     remaining_slots = MAX_POSTS_PER_CYCLE - len(chosen)
-    if remaining_slots > 0:
+    if remaining_slots:
+        chosen.extend(iran_items[:remaining_slots])
+    remaining_slots = MAX_POSTS_PER_CYCLE - len(chosen)
+    if remaining_slots:
         _, _, recent_total = await current_ratio_counts()
         world_allowed = (
-            not iran_items or
+            not (protest_items or iran_items) or
             (recent_total >= 5 and iran_share >= iran_target / 100) or
             (world_count < max(1, round((recent_total + 1) * world_target / 100)))
         )
