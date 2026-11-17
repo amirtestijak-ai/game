@@ -35,7 +35,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
-    InputMediaPhoto, InputMediaVideo,
+    InputMediaPhoto, InputMediaVideo, BufferedInputFile,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -75,7 +75,7 @@ SOURCES = [
         "url": "https://www.iranintl.com/en/feed", "category": "iran",
     },
     {
-        "id": "iranintl_liveblog", "name": "Iran International — پوشش زنده فارسی",
+        "id": "iranintl_liveblog", "name": "Iran International",
         "url": "https://www.iranintl.com/fa/liveblog/iran-conflict-november17",
         "category": "iran", "type": "liveblog",
     },
@@ -155,6 +155,21 @@ PROTEST_TERMS = (
     "اعتراض", "اعتراضات", "اعتراضی", "معترض", "معترضان", "تجمع",
     "تجمعات", "اعتصاب", "اعتصابات", "اعتصابی", "بازنشستگان",
     "دانشجویان", "کارگران", "فرهنگیان", "کسبه", "مردم معترض",
+)
+
+IMPORTANT_TERMS = (
+    "government", "president", "parliament", "minister", "election", "sanction", "sanctions",
+    "war", "attack", "missile", "nuclear", "security", "diplomacy", "diplomatic",
+    "human rights", "detained", "arrested", "execution", "internet blackout", "shutdown",
+    "oil", "inflation", "currency", "crisis", "resign", "resignation", "political",
+    "دولت", "رئیس جمهور", "رییس جمهور", "مجلس", "وزیر", "انتخابات", "تحریم", "جنگ",
+    "حمله", "موشک", "هسته ای", "امنیتی", "دیپلماسی", "حقوق بشر", "بازداشت", "اعدام",
+    "قطع اینترنت", "اختلال اینترنت", "نفت", "تورم", "ارز", "بحران", "استعفا", "سیاسی",
+)
+LOW_VALUE_TERMS = (
+    "recipe", "restaurant", "food trend", "celebrity style", "horoscope", "pet of the day",
+    "mouse intestine", "روده موش", "دستور پخت", "رستوران", "مد و زیبایی", "فال روزانه",
+    "حیوان خانگی", "سرگرمی روزمره", "آشپزی",
 )
 
 
@@ -476,6 +491,74 @@ async def fetch_liveblog(session, source):
     return source["id"], results[:40], None
 
 
+class MetaMediaParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.image = None
+        self.video = None
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta":
+            prop = (a.get("property") or a.get("name") or "").lower()
+            content = a.get("content", "").strip()
+            if content.startswith("http"):
+                if prop in ("og:image", "twitter:image", "twitter:image:src") and not self.image:
+                    self.image = content
+                if prop in ("og:video", "og:video:url", "og:video:secure_url") and not self.video:
+                    self.video = content
+        elif tag == "video" and not self.video:
+            self.video = a.get("src")
+
+
+async def enrich_media(session, item):
+    if item.get("image") or item.get("video"):
+        return item
+    link = item.get("link", "")
+    if not link.startswith("http"):
+        return item
+    try:
+        async with session.get(link, headers={"User-Agent": "Mozilla/5.0 VynexaNewsBot"},
+                              timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status >= 400:
+                return item
+            body = await resp.text(errors="replace")
+        parser = MetaMediaParser()
+        parser.feed(body[:1500000])
+        item["image"] = parser.image
+        item["video"] = parser.video
+    except Exception as exc:
+        log.debug("Media metadata unavailable for %s: %s", link, str(exc)[:100])
+    return item
+
+
+def concise_summary(text, limit=360):
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # Prefer a complete sentence; if there is no sentence boundary, end at a word.
+    ends = [cut.rfind(mark) for mark in (".", "!", "?", "؟", "؛")]
+    end = max(ends)
+    if end >= int(limit * 0.55):
+        return cut[:end + 1].strip()
+    return cut.rsplit(" ", 1)[0].rstrip(" ،؛:") + "…"
+
+
+def is_important_item(item):
+    text = (item.get("title", "") + " " + item.get("summary", "")).casefold()
+    if any(term.casefold() in text for term in LOW_VALUE_TERMS):
+        return False
+    return (is_protest_item(item) or any(term.casefold() in text for term in IMPORTANT_TERMS)
+            or item.get("source_id") == "iranintl_liveblog")
+
+
+def source_display_name(item):
+    sid = item.get("source_id", "")
+    if sid.startswith("iranintl"):
+        return "Iran International"
+    return item.get("source_name") or sid
+
+
 async def fetch_source(session: aiohttp.ClientSession, source):
     if source.get("type") == "liveblog":
         try:
@@ -670,7 +753,7 @@ async def make_persian_copy(item):
                 first, rest = translated.split("\n", 1)
                 first = re.sub(r"^(عنوان|HEADLINE)\s*:\s*", "", first, flags=re.I).strip()
                 rest = re.sub(r"^(خلاصه|متن|EXCERPT)\s*:\s*", "", rest, flags=re.I).strip()
-                return first[:320] or title, rest[:420]
+                return first[:320] or title, concise_summary(rest, 360)
             return translated[:320] or title, ""
         except Exception as exc:
             log.warning("Combined AI translation failed: %s", str(exc)[:140])
@@ -686,7 +769,7 @@ async def make_persian_copy(item):
             summary_fa = await translate_text(excerpt)
         except Exception as exc:
             log.warning("RSS excerpt translation unavailable; publishing without excerpt: %s", str(exc)[:140])
-    return (title_fa or title)[:320], summary_fa[:420]
+    return (title_fa or title)[:320], concise_summary(summary_fa, 360)
 
 
 def classify_item(item):
@@ -737,34 +820,51 @@ async def publish_item(item):
     # HTML link keeps the original URL hidden behind the short word «مشاهده».
     safe_title = html.escape(title_fa)
     safe_summary = html.escape(summary_fa)
-    safe_source = html.escape(item["source_name"])
+    safe_source = html.escape(source_display_name(item))
     safe_link = html.escape(item["link"], quote=True)
+    # Automatically read the destination channel username/ID and append it under every post.
+    try:
+        channel_chat = await bot.get_chat(destination)
+        channel_id_text = "@" + channel_chat.username if channel_chat.username else str(channel_chat.id)
+    except Exception:
+        channel_id_text = destination
+    safe_channel_id = html.escape(channel_id_text)
     caption = f"{label}\n\n📰 {safe_title}"
     if safe_summary:
-        caption += f"\n\n{safe_summary}"
-    caption += f"\n\nمنبع: {safe_source}\n🔗 <a href=\"{safe_link}\">مشاهده</a>"
+        caption += f"\n\n{html.escape(concise_summary(summary_fa, 360))}"
+    caption += f"\n\nمنبع: {safe_source}\n🔗 <a href=\"{safe_link}\">مشاهده</a>\n\n🛑 {safe_channel_id}"
 
-    post_images = await get_setting("post_images", POST_IMAGES_DEFAULT) == "1"
+    # If RSS omitted media, inspect the publisher article page for OpenGraph image/video.
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=16)) as media_session:
+        await enrich_media(media_session, item)
+    video_url = item.get("video")
+    image_url = item.get("image")
     try:
-        video_url = item.get("video")
-        image_url = item.get("image") if post_images else None
-        # If the feed provides both, publish them together as one Telegram album.
-        if video_url and image_url:
-            media = [
-                InputMediaPhoto(media=image_url, caption=caption, parse_mode="HTML"),
-                InputMediaVideo(media=video_url),
-            ]
-            await bot.send_media_group(destination, media=media)
-        elif video_url:
-            await bot.send_video(destination, video=video_url, caption=caption, parse_mode="HTML")
-        elif image_url:
-            await bot.send_photo(destination, photo=image_url, caption=caption, parse_mode="HTML")
-        else:
-            await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=True)
+        # Download media to memory first; this avoids Telegram failing on publisher hotlink URLs.
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as media_session:
+            if video_url:
+                async with media_session.get(video_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                    resp.raise_for_status()
+                    data = await resp.read()
+                if len(data) <= 48 * 1024 * 1024:
+                    await bot.send_video(destination, BufferedInputFile(data, filename="news.mp4"), caption=caption, parse_mode="HTML")
+                elif image_url:
+                    video_url = None
+            if not video_url and image_url:
+                async with media_session.get(image_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                    resp.raise_for_status()
+                    data = await resp.read()
+                if len(data) <= 9 * 1024 * 1024:
+                    await bot.send_photo(destination, BufferedInputFile(data, filename="news.jpg"), caption=caption, parse_mode="HTML")
+                else:
+                    await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=True)
+            elif not video_url and not image_url:
+                await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as exc:
-        log.warning("Media post failed; trying text fallback: %s", str(exc)[:180])
+        log.warning("Media upload failed for %s: %s", item.get("link"), str(exc)[:180])
+        # Do not pretend a media upload succeeded; use a link preview only as last resort.
         try:
-            await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=True)
+            await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=False)
         except Exception:
             log.exception("Could not publish article")
             return False
@@ -828,6 +928,10 @@ async def poll_once():
                 item["category"] = classify_item(item)
                 candidates.append(item)
 
+    # Reject low-value items (celebrity/food/oddity filler) and keep important politics,
+    # protests, security, diplomacy and major public-affairs stories.
+    candidates = [item for item in candidates if is_important_item(item)]
+
     # The same story can appear in the official RSS and several discovery feeds.
     # Deduplicate by canonical article URL before selecting posts.
     unique = {}
@@ -842,38 +946,19 @@ async def poll_once():
             unique[canonical] = item
     candidates = list(unique.values())
 
-    # Strict priority: Iran International protest coverage first, then all other
-    # Iran International stories, then other Iran protest/news, and world last.
-    iranintl_items = [x for x in candidates if x.get("source_id", "").startswith("iranintl")]
-    other_iran_items = [x for x in candidates if x["category"] == "iran" and x not in iranintl_items]
-    world_items = [x for x in candidates if x["category"] == "world"]
-
+    # Priority: Iran protests first across every outlet; then major Iran political news;
+    # then major international political/current-affairs stories. Do not let one outlet monopolize.
     def rank(item):
-        official = item.get("source_id", "").startswith("iranintl")
         protest = is_protest_item(item)
-        if official and protest:
+        iran = item["category"] == "iran"
+        if protest and iran:
             return 0
-        if official:
+        if iran:
             return 1
-        if protest and item["category"] == "iran":
-            return 2
-        if item["category"] == "iran":
-            return 3
-        return 4
+        return 2
 
     candidates.sort(key=lambda x: (rank(x), -x["timestamp"]))
-    # Fill all five slots from Iran International whenever available.
-    chosen = iranintl_items.copy()
-    chosen.sort(key=lambda x: (0 if is_protest_item(x) else 1, -x["timestamp"]))
-    chosen = chosen[:MAX_POSTS_PER_CYCLE]
-    remaining_slots = MAX_POSTS_PER_CYCLE - len(chosen)
-    if remaining_slots:
-        other_iran_items.sort(key=lambda x: (0 if is_protest_item(x) else 1, -x["timestamp"]))
-        chosen.extend(other_iran_items[:remaining_slots])
-    remaining_slots = MAX_POSTS_PER_CYCLE - len(chosen)
-    if remaining_slots:
-        world_items.sort(key=lambda x: x["timestamp"], reverse=True)
-        chosen.extend(world_items[:remaining_slots])
+    chosen = candidates[:MAX_POSTS_PER_CYCLE]
 
     posted = 0
     for item in chosen:
