@@ -1,21 +1,30 @@
-SECRET SOCIETY + BLUPAL XP PAYMENTS
+# خبرگزاری تلگرامی خودکار
 
-Environment variables required:
-BOT_TOKEN=your_telegram_bot_token
-ADMIN_ID=your_numeric_telegram_user_id
-BLUPAL_API_KEY=blu_live_your_api_key
+این نسخه جایگزین بازی SECRET SOCIETY شده؛ فایل اصلی اجرا `bot.py` است. فایل `secret_society_bot.py` هم فقط نسخه خبرگزاری را اجرا می‌کند.
 
-Install:
-pip install -r requirements.txt
+## متغیرهای محیطی در FadeHost
+- `BOT_TOKEN` = همان توکن ربات قبلی
+- `ADMIN_ID` = همان آیدی عددی مالک قبلی
+- `PORT` = `8080` (اگر هاست لازم دارد)
+- `DB_PATH` = اختیاری؛ پیش‌فرض `secret_society.sqlite3`
 
-Run:
-python secret_society_bot_final.py
+**OPENAI_API_KEY لازم نیست و اصلاً نباید اضافه‌اش کنی.** تیتر و خلاصه کوتاه RSS با مترجم عمومی به فارسی ترجمه می‌شوند.
 
-Setup:
-1. Add BLUPAL_API_KEY to the server environment. Never send the API key in Telegram or commit it to GitHub.
-2. Start the bot and open the admin panel.
-3. Choose "قیمت‌گذاری XP" and set the price of 100 XP in toman (minimum 10,000 toman due to Blupal's invoice minimum).
-4. Users can open "خرید XP", choose 100/500/1000 XP, pay the invoice, then press "بررسی پرداخت".
-5. XP is added only after the bot independently checks the invoice status through Blupal's API and confirms PAID, live mode, and matching amounts. Each invoice can be credited only once.
+## اجرا
+`pip install -r requirements.txt`
+`python bot.py`
 
-The bot uses the existing SQLite database file secret_society.sqlite3. Back it up before deployment. The payment table is added automatically without deleting existing user/game data.
+## راه‌اندازی
+1. ربات را اجرا کن و `/start` بزن.
+2. با حساب مالک قبلی `/panel` را بفرست.
+3. کانال مقصد را مثل `@my_channel` ثبت کن.
+4. ربات را در کانال ادمین کن و اجازه ارسال پست بده.
+5. از پنل منابع و انتشار خودکار را مدیریت کن.
+
+## مدیران قبلی
+پیش‌فرض دیتابیس روی `secret_society.sqlite3` تنظیم شده تا جدول `admins` بازی قبلی قابل استفاده بماند. `ADMIN_ID` همان شناسه مالک قبلی است. دیتابیس باید روی فضای پایدار هاست باشد.
+
+## منابع و تصاویر
+هدف نسبت خبرها ۸۰٪ ایران و ۲۰٪ جهان است. BBC و رسانه‌های دولتی داخلی در فهرست نیستند. منابع شامل ایران اینترنشنال، ایران‌وایر، رادیو فردا، رویترز، آسوشیتدپرس، الجزیره، دویچه‌وله، WSJ، یورونیوز و فرانس۲۴ هستند. ارسال تصویر RSS پیش‌فرض روشن است؛ فقط در محدوده مجوزی که تهیه کرده‌ای از تصاویر استفاده کن.
+
+این نسخه بازی، مأموریت، XP، جایزه و کیف پول را اجرا نمی‌کند؛ همه فایل‌های اجرایی مخزن به نسخه خبرگزاری تغییر داده شده‌اند.

@@ -38,12 +38,10 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
-DB_PATH = os.getenv("DB_PATH", "newsbot.sqlite3")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+DB_PATH = os.getenv("DB_PATH", "secret_society.sqlite3")
 DEFAULT_INTERVAL = 60
 MAX_POSTS_PER_CYCLE = 5
-POST_IMAGES_DEFAULT = "0"  # enable only when the channel has permission to reuse source images
+POST_IMAGES_DEFAULT = "1"  # enable only when the channel has permission to reuse source images
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise RuntimeError("BOT_TOKEN and ADMIN_ID environment variables are required.")
@@ -312,46 +310,15 @@ async def translate_text(text: str) -> str:
 
 
 async def make_persian_copy(item):
-    title_fa = item["title"]
+    title_fa = await translate_text(item["title"])
     summary_fa = ""
-    if OPENAI_API_KEY:
-        # Use only the RSS headline and short RSS excerpt; do not scrape full articles.
-        prompt = (
-            "خبر زیر را به فارسی روان و بی‌طرف بازنویسی کن. "
-            "یک تیتر کوتاه و یک خلاصه مستقل حداکثر دو جمله‌ای بده. "
-            "واقعیت تازه‌ای اضافه نکن، ادعاها را به منبع نسبت بده، "
-            "و اگر جزئیات کافی نیست فقط تیتر را ترجمه کن. "
-            "خروجی فقط با قالب: تیتر: ...\\nخلاصه: ...\\n"
-            f"منبع: {item['source_name']}\\nتیتر: {item['title']}\\n"
-            f"چکیده RSS: {item['summary'][:900]}"
-        )
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        payload = {
-            "model": OPENAI_MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a neutral Persian-language news editor. Attribute disputed claims and never invent facts."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-        }
-        timeout = aiohttp.ClientTimeout(total=35)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers, json=payload
-            ) as resp:
-                body = await resp.json(content_type=None)
-                if resp.status >= 400:
-                    raise RuntimeError(f"OpenAI HTTP {resp.status}: {str(body)[:250]}")
-        content = body["choices"][0]["message"]["content"].strip()
-        if "خلاصه:" in content and "تیتر:" in content:
-            title_fa = content.split("تیتر:", 1)[1].split("خلاصه:", 1)[0].strip()
-            summary_fa = content.split("خلاصه:", 1)[1].strip()
-        else:
-            title_fa = content[:500]
-    else:
-        title_fa = await translate_text(item["title"])
-    return title_fa[:320], summary_fa[:420]
+    excerpt = (item.get("summary") or "").strip()
+    if excerpt:
+        try:
+            summary_fa = await translate_text(excerpt[:900])
+        except Exception as exc:
+            log.warning("RSS excerpt translation failed: %s", str(exc)[:120])
+    return (title_fa or item["title"])[:320], summary_fa[:420]
 
 
 def classify_item(item):
@@ -400,14 +367,14 @@ async def publish_item(item):
     title_fa, summary_fa = await make_persian_copy(item)
     label = "🇮🇷 ایران" if category == "iran" else "🌍 جهان"
     caption = (
-        f"{label}\\n\\n"
-        f"📰 {title_fa}\\n"
+        f"{label}\n\n"
+        f"📰 {title_fa}\n"
     )
     if summary_fa:
-        caption += f"\\n{summary_fa}\\n"
+        caption += f"\n{summary_fa}\n"
     caption += (
-        f"\\nمنبع: {item['source_name']}"
-        f"\\n🔗 {item['link']}"
+        f"\nمنبع: {item['source_name']}"
+        f"\n🔗 {item['link']}"
     )
     caption = caption[:1020]
 
@@ -539,29 +506,22 @@ async def news_loop():
 
 async def set_bot_commands():
     await bot.set_my_commands([
-        BotCommand(command="start", description="شروع"),
+        BotCommand(command="start", description="شروع خبرگزاری"),
+        BotCommand(command="panel", description="پنل مدیریت"),
     ], scope=BotCommandScopeDefault())
-    for uid in await admin_ids():
-        try:
-            await bot.set_my_commands([
-                BotCommand(command="start", description="شروع"),
-                BotCommand(command="panel", description="پنل مدیریت"),
-            ], scope=BotCommandScopeChat(chat_id=uid))
-        except Exception as exc:
-            log.warning("Could not set admin commands for %s: %s", uid, exc)
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
     text = (
-        "📰 <b>خبرگزاری خودکار</b>\\n\\n"
+        "📰 <b>خبرگزاری خودکار</b>\n\n"
         "این ربات خبرهای منابع انتخاب‌شده را دریافت می‌کند، "
-        "به فارسی برمی‌گرداند و در کانال مدیر منتشر می‌کند.\\n\\n"
-        "🇮🇷 هدف پوشش: ۸۰٪ ایران\\n"
+        "به فارسی برمی‌گرداند و در کانال مدیر منتشر می‌کند.\n\n"
+        "🇮🇷 هدف پوشش: ۸۰٪ ایران\n"
         "🌍 هدف پوشش: ۲۰٪ جهان"
     )
     if await is_admin(message.from_user.id):
-        await message.answer(text + "\\n\\nبرای تنظیمات از /panel استفاده کن.", parse_mode="HTML")
+        await message.answer(text + "\n\nبرای تنظیمات از /panel استفاده کن.", parse_mode="HTML")
     else:
         await message.answer(text, parse_mode="HTML")
 
@@ -594,9 +554,9 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         await state.set_state(AdminFlow.channel)
         current = await get_setting("channel", "")
         return await call.message.edit_text(
-            "📢 آیدی یا لینک کانال عمومی رو بفرست.\\nمثال: @my_channel\\n"
-            "ربات باید در کانال ادمین و دارای اجازه ارسال پست باشه.\\n\\n"
-            f"مقدار فعلی: {current or 'تنظیم نشده'}\\nبرای لغو /cancel",
+            "📢 آیدی یا لینک کانال عمومی رو بفرست.\nمثال: @my_channel\n"
+            "ربات باید در کانال ادمین و دارای اجازه ارسال پست باشه.\n\n"
+            f"مقدار فعلی: {current or 'تنظیم نشده'}\nبرای لغو /cancel",
             reply_markup=back_keyboard(),
         )
 
@@ -604,7 +564,7 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         await state.set_state(AdminFlow.interval)
         current = await get_setting("interval", str(DEFAULT_INTERVAL))
         return await call.message.edit_text(
-            f"⏱ فاصله بررسی فعلی: {current} ثانیه\\nعدد بین ۳۰ تا ۳۶۰۰ بفرست.",
+            f"⏱ فاصله بررسی فعلی: {current} ثانیه\nعدد بین ۳۰ تا ۳۶۰۰ بفرست.",
             reply_markup=back_keyboard(),
         )
 
@@ -623,7 +583,7 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         new_value = "0" if current == "1" else "1"
         await set_setting("post_images", new_value)
         label = "روشن" if new_value == "1" else "خاموش"
-        note = "\\nفقط وقتی روشنش کن که اجازه بازنشر تصویر منبع رو داشته باشی."
+        note = "\nفقط وقتی روشنش کن که اجازه بازنشر تصویر منبع رو داشته باشی."
         return await call.message.edit_text(
             f"🖼 انتشار تصویر خبر: {label}{note}",
             reply_markup=admin_keyboard(),
@@ -631,7 +591,7 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
 
     if action == "ratio":
         return await call.message.edit_text(
-            "🇮🇷 سهمیه هدف: ۸۰٪ اخبار ایران\\n🌍 سهمیه هدف: ۲۰٪ اخبار جهان\\n"
+            "🇮🇷 سهمیه هدف: ۸۰٪ اخبار ایران\n🌍 سهمیه هدف: ۲۰٪ اخبار جهان\n"
             "این نسبت با توجه به خبرهای موجود و در بازه آخرین پست‌ها اعمال می‌شه.",
             reply_markup=back_keyboard(),
         )
@@ -647,7 +607,7 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
             )])
         rows.append([InlineKeyboardButton(text="⬅️ پنل مدیریت", callback_data="adm:panel")])
         return await call.message.edit_text(
-            "📰 منابع خبری\\nروی هر منبع بزن تا فعال/غیرفعال بشه:",
+            "📰 منابع خبری\nروی هر منبع بزن تا فعال/غیرفعال بشه:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
@@ -669,7 +629,7 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
                 f"{'🟢' if not error else '🔴'} {source['name']}: "
                 f"{len(entries)} خبر" + (f" — {html.escape(error[:90])}" if error else "")
             )
-        return await call.message.answer("\\n".join(lines), parse_mode="HTML", reply_markup=admin_keyboard())
+        return await call.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=admin_keyboard())
 
     if action == "stats":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -681,12 +641,12 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
         interval = await get_setting("interval", str(DEFAULT_INTERVAL))
         ratio = round((iran / total) * 100) if total else 0
         return await call.message.edit_text(
-            f"📊 <b>آمار خبرگزاری</b>\\n\\n"
-            f"وضعیت انتشار: {'🟢 روشن' if enabled else '🔴 خاموش'}\\n"
-            f"کانال: {html.escape(channel)}\\n"
-            f"فاصله بررسی: {interval} ثانیه\\n"
-            f"کل پست‌ها: {total}\\n"
-            f"اخبار ایران: {iran} ({ratio}٪)\\n"
+            f"📊 <b>آمار خبرگزاری</b>\n\n"
+            f"وضعیت انتشار: {'🟢 روشن' if enabled else '🔴 خاموش'}\n"
+            f"کانال: {html.escape(channel)}\n"
+            f"فاصله بررسی: {interval} ثانیه\n"
+            f"کل پست‌ها: {total}\n"
+            f"اخبار ایران: {iran} ({ratio}٪)\n"
             f"اخبار جهان: {world}",
             reply_markup=back_keyboard(), parse_mode="HTML",
         )
@@ -727,13 +687,13 @@ async def save_channel(message: Message, state: FSMContext):
     try:
         chat = await bot.get_chat(value)
         await message.answer(
-            f"✅ کانال ثبت شد: {chat.title or value}\\n"
+            f"✅ کانال ثبت شد: {chat.title or value}\n"
             "مطمئن شو ربات در کانال ادمین و مجاز به ارسال پسته.",
             reply_markup=admin_keyboard(),
         )
     except Exception as exc:
         await message.answer(
-            f"⚠️ آدرس ذخیره شد، اما بررسی کانال موفق نبود: {str(exc)[:180]}\\n"
+            f"⚠️ آدرس ذخیره شد، اما بررسی کانال موفق نبود: {str(exc)[:180]}\n"
             "ربات رو به کانال اضافه کن و دسترسی ارسال پست بده.",
             reply_markup=admin_keyboard(),
         )

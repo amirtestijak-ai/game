@@ -1,22 +1,30 @@
-# SECRET SOCIETY Telegram Bot
+# خبرگزاری تلگرامی خودکار
 
-## Environment variables
-- `BOT_TOKEN`: Telegram bot token
-- `ADMIN_ID`: numeric Telegram user ID of the owner/admin
+این نسخه جایگزین بازی SECRET SOCIETY شده؛ فایل اصلی اجرا `bot.py` است. فایل `secret_society_bot.py` هم فقط نسخه خبرگزاری را اجرا می‌کند.
 
-## Start command
-`python secret_society_bot.py`
+## متغیرهای محیطی در FadeHost
+- `BOT_TOKEN` = همان توکن ربات قبلی
+- `ADMIN_ID` = همان آیدی عددی مالک قبلی
+- `PORT` = `8080` (اگر هاست لازم دارد)
+- `DB_PATH` = اختیاری؛ پیش‌فرض `secret_society.sqlite3`
 
-## Required channel membership
-The bot checks membership in `@dsgjnjjyfg`. Add the bot to that channel as an administrator (no posting permissions are needed) so Telegram allows it to check member status. Users must join and press the membership verification button before using the bot.
+**OPENAI_API_KEY لازم نیست و اصلاً نباید اضافه‌اش کنی.** تیتر و خلاصه کوتاه RSS با مترجم عمومی به فارسی ترجمه می‌شوند.
 
-## Button colors
-Telegram inline buttons support preset styles only: `primary` (blue), `success` (green), and `danger` (red). Each configurable menu button has its own saved style.
+## اجرا
+`pip install -r requirements.txt`
+`python bot.py`
 
-## Referral reports
-The admin panel includes a referral report showing inviter/invitee details and top inviters. Referral credit is applied after the invited user passes the channel membership check.
+## راه‌اندازی
+1. ربات را اجرا کن و `/start` بزن.
+2. با حساب مالک قبلی `/panel` را بفرست.
+3. کانال مقصد را مثل `@my_channel` ثبت کن.
+4. ربات را در کانال ادمین کن و اجازه ارسال پست بده.
+5. از پنل منابع و انتشار خودکار را مدیریت کن.
 
-## Persistent storage
-When `/data` exists, SQLite and mission images are stored there; otherwise they are stored beside the script.
+## مدیران قبلی
+پیش‌فرض دیتابیس روی `secret_society.sqlite3` تنظیم شده تا جدول `admins` بازی قبلی قابل استفاده بماند. `ADMIN_ID` همان شناسه مالک قبلی است. دیتابیس باید روی فضای پایدار هاست باشد.
 
-Never commit your bot token or database to GitHub.
+## منابع و تصاویر
+هدف نسبت خبرها ۸۰٪ ایران و ۲۰٪ جهان است. BBC و رسانه‌های دولتی داخلی در فهرست نیستند. منابع شامل ایران اینترنشنال، ایران‌وایر، رادیو فردا، رویترز، آسوشیتدپرس، الجزیره، دویچه‌وله، WSJ، یورونیوز و فرانس۲۴ هستند. ارسال تصویر RSS پیش‌فرض روشن است؛ فقط در محدوده مجوزی که تهیه کرده‌ای از تصاویر استفاده کن.
+
+این نسخه بازی، مأموریت، XP، جایزه و کیف پول را اجرا نمی‌کند؛ همه فایل‌های اجرایی مخزن به نسخه خبرگزاری تغییر داده شده‌اند.
