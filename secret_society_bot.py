@@ -1,4 +1,4 @@
-"""Compatibility entrypoint: starts the replacement news publisher."""
+"""Compatibility entrypoint for the Vynexa News Bot."""
 import asyncio
 from bot import main
 

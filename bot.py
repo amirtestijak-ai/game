@@ -104,7 +104,7 @@ SOURCES = [
     },
     {
         "id": "france24_iran", "name": "France 24 — Iran",
-        "url": "https://www.france24.com/en/tag/iran/rss", "category": "iran",
+        "url": "https://news.google.com/rss/search?q=site%3Afrance24.com+Iran&hl=en-US&gl=US&ceid=US:en", "category": "iran",
     },
 ]
 
@@ -201,6 +201,7 @@ async def init_db():
         "iran_percent": "80",
         "world_percent": "20",
         "seeded": "0",
+        "initial_backfill_done": "0",
     }
     for key, value in defaults.items():
         if await get_setting(key, "") == "":
@@ -310,15 +311,20 @@ async def translate_text(text: str) -> str:
 
 
 async def make_persian_copy(item):
-    title_fa = await translate_text(item["title"])
+    # Translation is best-effort; temporary translator failures must not block posting.
+    title_fa = item["title"]
     summary_fa = ""
+    try:
+        title_fa = await translate_text(item["title"]) or item["title"]
+    except Exception as exc:
+        log.warning("Title translation failed; using original title: %s", str(exc)[:120])
     excerpt = (item.get("summary") or "").strip()
     if excerpt:
         try:
             summary_fa = await translate_text(excerpt[:900])
         except Exception as exc:
             log.warning("RSS excerpt translation failed: %s", str(exc)[:120])
-    return (title_fa or item["title"])[:320], summary_fa[:420]
+    return title_fa[:320], summary_fa[:420]
 
 
 def classify_item(item):
@@ -404,17 +410,14 @@ async def publish_item(item):
 
 
 async def seed_existing_articles(session):
-    """On first run, mark current feed contents as old to avoid flooding the channel."""
-    if await get_setting("seeded", "0") == "1":
+    """One-time migration: unmark indexed items that were never actually published."""
+    if await get_setting("initial_backfill_done", "0") == "1":
         return
-    log.info("First run: indexing existing feed entries to avoid posting old news.")
-    tasks = [fetch_source(session, source) for source in SOURCES]
-    results = await asyncio.gather(*tasks)
-    for source_id, entries, error in results:
-        for item in entries:
-            await mark_seen(item, classify_item(item))
-        if error:
-            log.warning("Seed feed %s: %s", source_id, error)
+    log.info("Preparing first batch of current headlines for the channel.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM seen_articles WHERE guid NOT IN (SELECT guid FROM posted_articles)")
+        await db.commit()
+    await set_setting("initial_backfill_done", "1")
     await set_setting("seeded", "1")
 
 
@@ -450,7 +453,7 @@ async def poll_once():
                 item["category"] = classify_item(item)
                 candidates.append(item)
 
-    candidates.sort(key=lambda x: x["timestamp"])
+    candidates.sort(key=lambda x: x["timestamp"], reverse=True)
     iran_items = [x for x in candidates if x["category"] == "iran"]
     world_items = [x for x in candidates if x["category"] == "world"]
 
@@ -491,8 +494,7 @@ async def news_loop():
     while True:
         try:
             result = await poll_once()
-            if result["posted"] or result["errors"]:
-                log.info("News poll: %s", result)
+            log.info("News poll: %s", result)
         except asyncio.CancelledError:
             raise
         except Exception:
