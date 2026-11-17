@@ -41,6 +41,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 DB_PATH = os.getenv("DB_PATH", "secret_society.sqlite3")
 DEFAULT_INTERVAL = 60
 MAX_POSTS_PER_CYCLE = 5
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+TRANSLATION_LOCK = asyncio.Lock()
+TRANSLATION_LAST_CALL = 0.0
 POST_IMAGES_DEFAULT = "1"  # enable only when the channel has permission to reuse source images
 
 if not BOT_TOKEN or not ADMIN_ID:
@@ -104,7 +108,7 @@ SOURCES = [
     },
     {
         "id": "france24_iran", "name": "France 24 — Iran",
-        "url": "https://news.google.com/rss/search?q=site%3Afrance24.com+Iran&hl=en-US&gl=US&ceid=US:en", "category": "iran",
+        "url": "https://www.france24.com/en/tag/iran/rss", "category": "iran",
     },
 ]
 
@@ -192,6 +196,12 @@ async def init_db():
         await db.execute(
             "CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, added_at TEXT)"
         )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS translation_cache(
+                cache_key TEXT PRIMARY KEY, source_text TEXT NOT NULL,
+                translated_text TEXT NOT NULL, created_at TEXT NOT NULL
+            )"""
+        )
         await db.commit()
     defaults = {
         "channel": os.getenv("NEWS_CHANNEL", "").strip(),
@@ -201,7 +211,6 @@ async def init_db():
         "iran_percent": "80",
         "world_percent": "20",
         "seeded": "0",
-        "initial_backfill_done": "0",
     }
     for key, value in defaults.items():
         if await get_setting(key, "") == "":
@@ -233,7 +242,9 @@ def clean_html(value: str) -> str:
 def extract_image(entry):
     for item in entry.get("media_content", []) or []:
         url = item.get("url")
-        if url and url.startswith("https://"):
+        kind = (item.get("type") or "").lower()
+        medium = (item.get("medium") or "").lower()
+        if url and url.startswith("https://") and (kind.startswith("image/") or medium == "image" or not kind and not medium):
             return url
     for item in entry.get("media_thumbnail", []) or []:
         url = item.get("url")
@@ -241,8 +252,21 @@ def extract_image(entry):
             return url
     for item in entry.get("enclosures", []) or []:
         url = item.get("href") or item.get("url")
-        kind = item.get("type", "")
+        kind = (item.get("type") or "").lower()
         if url and url.startswith("https://") and kind.startswith("image/"):
+            return url
+    return None
+
+
+def extract_video(entry):
+    """Return only a direct video file URL advertised by the feed."""
+    candidates = list(entry.get("media_content", []) or [])
+    candidates += list(entry.get("enclosures", []) or [])
+    for item in candidates:
+        url = item.get("url") or item.get("href")
+        kind = (item.get("type") or "").lower()
+        medium = (item.get("medium") or "").lower()
+        if url and url.startswith("https://") and (kind.startswith("video/") or medium == "video"):
             return url
     return None
 
@@ -288,6 +312,7 @@ async def fetch_source(session: aiohttp.ClientSession, source):
                 "summary": summary[:1200],
                 "link": link,
                 "image": extract_image(entry),
+                "video": extract_video(entry),
                 "timestamp": entry_timestamp(entry),
             })
         return source["id"], results, None
@@ -295,36 +320,142 @@ async def fetch_source(session: aiohttp.ClientSession, source):
         return source["id"], [], f"{type(exc).__name__}: {str(exc)[:180]}"
 
 
+async def cached_translation(text: str):
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            "SELECT translated_text FROM translation_cache WHERE cache_key=?", (key,)
+        )).fetchone()
+    return row[0] if row else None
+
+
+async def save_translation(text: str, translated: str):
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO translation_cache(cache_key,source_text,translated_text,created_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET translated_text=excluded.translated_text",
+            (key, text, translated, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+
+
+async def translate_with_openai(text: str) -> str:
+    """Optional AI translation. It is used only when OPENAI_API_KEY is configured."""
+    timeout = aiohttp.ClientTimeout(total=35)
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": "Translate the supplied news text into fluent, neutral Persian. Preserve names, numbers and facts. Do not add facts or commentary. Return only the Persian translation."},
+            {"role": "user", "content": text[:3000]},
+        ],
+    }
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload) as resp:
+            if resp.status == 429:
+                raise RuntimeError("OpenAI rate limit (429)")
+            resp.raise_for_status()
+            data = await resp.json()
+    result = data["choices"][0]["message"]["content"].strip()
+    if not result:
+        raise RuntimeError("Empty AI translation")
+    return result
+
+
 async def translate_text(text: str) -> str:
+    global TRANSLATION_LAST_CALL
     text = (text or "").strip()
     if not text:
         return ""
-    # Public Google Translate endpoint is used only as a no-key fallback.
-    url = "https://translate.googleapis.com/translate_a/single"
-    params = {"client": "gtx", "sl": "auto", "tl": "fa", "dt": "t", "q": text[:3500]}
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, params=params) as resp:
-            resp.raise_for_status()
-            data = await resp.json(content_type=None)
-    return "".join(part[0] for part in data[0] if part and part[0]).strip()
+    text = text[:3000]
+    cached = await cached_translation(text)
+    if cached:
+        return cached
+
+    async with TRANSLATION_LOCK:
+        # Re-check after acquiring the lock; another coroutine may have filled it.
+        cached = await cached_translation(text)
+        if cached:
+            return cached
+
+        if OPENAI_API_KEY:
+            try:
+                translated = await translate_with_openai(text)
+                await save_translation(text, translated)
+                return translated
+            except Exception as exc:
+                log.warning("AI translation failed; falling back to Google: %s", str(exc)[:150])
+
+        # Serialize public Google requests and back off automatically on 429/5xx.
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {"client": "gtx", "sl": "auto", "tl": "fa", "dt": "t", "q": text}
+        timeout = aiohttp.ClientTimeout(total=20)
+        last_error = None
+        for attempt in range(4):
+            wait = max(0.0, 2.5 - (time.monotonic() - TRANSLATION_LAST_CALL))
+            if wait:
+                await asyncio.sleep(wait)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, params=params) as resp:
+                        TRANSLATION_LAST_CALL = time.monotonic()
+                        if resp.status == 429 or resp.status >= 500:
+                            retry_after = resp.headers.get("Retry-After", "")
+                            try:
+                                delay = min(45.0, max(5.0, float(retry_after)))
+                            except (TypeError, ValueError):
+                                delay = min(45.0, 5.0 * (2 ** attempt))
+                            last_error = RuntimeError(f"Google Translate HTTP {resp.status}")
+                            if attempt < 3:
+                                log.warning("Translation rate limited; retrying in %.0fs", delay)
+                                await asyncio.sleep(delay)
+                                continue
+                            raise last_error
+                        resp.raise_for_status()
+                        data = await resp.json(content_type=None)
+                translated = "".join(part[0] for part in data[0] if part and part[0]).strip()
+                if translated:
+                    await save_translation(text, translated)
+                    return translated
+                raise RuntimeError("Empty translation response")
+            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+                last_error = exc
+                if attempt < 3 and not (isinstance(exc, RuntimeError) and "HTTP 429" in str(exc)):
+                    await asyncio.sleep(min(20, 2 ** (attempt + 1)))
+        raise RuntimeError(f"Translation unavailable: {last_error}")
 
 
 async def make_persian_copy(item):
-    # Translation is best-effort; temporary translator failures must not block posting.
-    title_fa = item["title"]
-    summary_fa = ""
+    # Translate title and excerpt together when AI is configured to reduce API calls.
+    title = item["title"]
+    excerpt = (item.get("summary") or "").strip()[:900]
+    if OPENAI_API_KEY:
+        combined = "HEADLINE: " + title + ("\nEXCERPT: " + excerpt if excerpt else "")
+        try:
+            translated = await translate_text(combined)
+            if "\n" in translated:
+                first, rest = translated.split("\n", 1)
+                first = re.sub(r"^(عنوان|HEADLINE)\s*:\s*", "", first, flags=re.I).strip()
+                rest = re.sub(r"^(خلاصه|متن|EXCERPT)\s*:\s*", "", rest, flags=re.I).strip()
+                return first[:320] or title, rest[:420]
+            return translated[:320] or title, ""
+        except Exception as exc:
+            log.warning("Combined AI translation failed: %s", str(exc)[:140])
+
     try:
-        title_fa = await translate_text(item["title"]) or item["title"]
+        title_fa = await translate_text(title)
     except Exception as exc:
-        log.warning("Title translation failed; using original title: %s", str(exc)[:120])
-    excerpt = (item.get("summary") or "").strip()
+        log.warning("Title translation unavailable; publishing original title: %s", str(exc)[:140])
+        title_fa = title
+    summary_fa = ""
     if excerpt:
         try:
-            summary_fa = await translate_text(excerpt[:900])
+            summary_fa = await translate_text(excerpt)
         except Exception as exc:
-            log.warning("RSS excerpt translation failed: %s", str(exc)[:120])
-    return title_fa[:320], summary_fa[:420]
+            log.warning("RSS excerpt translation unavailable; publishing without excerpt: %s", str(exc)[:140])
+    return (title_fa or title)[:320], summary_fa[:420]
 
 
 def classify_item(item):
@@ -372,28 +503,28 @@ async def publish_item(item):
     category = classify_item(item)
     title_fa, summary_fa = await make_persian_copy(item)
     label = "🇮🇷 ایران" if category == "iran" else "🌍 جهان"
-    caption = (
-        f"{label}\n\n"
-        f"📰 {title_fa}\n"
-    )
-    if summary_fa:
-        caption += f"\n{summary_fa}\n"
-    caption += (
-        f"\nمنبع: {item['source_name']}"
-        f"\n🔗 {item['link']}"
-    )
-    caption = caption[:1020]
+    # HTML link keeps the original URL hidden behind the short word «مشاهده».
+    safe_title = html.escape(title_fa)
+    safe_summary = html.escape(summary_fa)
+    safe_source = html.escape(item["source_name"])
+    safe_link = html.escape(item["link"], quote=True)
+    caption = f"{label}\n\n📰 {safe_title}"
+    if safe_summary:
+        caption += f"\n\n{safe_summary}"
+    caption += f"\n\nمنبع: {safe_source}\n🔗 <a href=\"{safe_link}\">مشاهده</a>"
 
     post_images = await get_setting("post_images", POST_IMAGES_DEFAULT) == "1"
     try:
-        if post_images and item.get("image"):
-            await bot.send_photo(destination, photo=item["image"], caption=caption)
+        if item.get("video"):
+            await bot.send_video(destination, video=item["video"], caption=caption, parse_mode="HTML")
+        elif post_images and item.get("image"):
+            await bot.send_photo(destination, photo=item["image"], caption=caption, parse_mode="HTML")
         else:
-            await bot.send_message(destination, caption, disable_web_page_preview=True)
+            await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as exc:
-        log.warning("Image post failed; trying text fallback: %s", str(exc)[:180])
+        log.warning("Media post failed; trying text fallback: %s", str(exc)[:180])
         try:
-            await bot.send_message(destination, caption, disable_web_page_preview=True)
+            await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             log.exception("Could not publish article")
             return False
@@ -410,14 +541,17 @@ async def publish_item(item):
 
 
 async def seed_existing_articles(session):
-    """One-time migration: unmark indexed items that were never actually published."""
-    if await get_setting("initial_backfill_done", "0") == "1":
+    """On first run, mark current feed contents as old to avoid flooding the channel."""
+    if await get_setting("seeded", "0") == "1":
         return
-    log.info("Preparing first batch of current headlines for the channel.")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM seen_articles WHERE guid NOT IN (SELECT guid FROM posted_articles)")
-        await db.commit()
-    await set_setting("initial_backfill_done", "1")
+    log.info("First run: indexing existing feed entries to avoid posting old news.")
+    tasks = [fetch_source(session, source) for source in SOURCES]
+    results = await asyncio.gather(*tasks)
+    for source_id, entries, error in results:
+        for item in entries:
+            await mark_seen(item, classify_item(item))
+        if error:
+            log.warning("Seed feed %s: %s", source_id, error)
     await set_setting("seeded", "1")
 
 
@@ -453,7 +587,7 @@ async def poll_once():
                 item["category"] = classify_item(item)
                 candidates.append(item)
 
-    candidates.sort(key=lambda x: x["timestamp"], reverse=True)
+    candidates.sort(key=lambda x: x["timestamp"])
     iran_items = [x for x in candidates if x["category"] == "iran"]
     world_items = [x for x in candidates if x["category"] == "world"]
 
@@ -494,7 +628,8 @@ async def news_loop():
     while True:
         try:
             result = await poll_once()
-            log.info("News poll: %s", result)
+            if result["posted"] or result["errors"]:
+                log.info("News poll: %s", result)
         except asyncio.CancelledError:
             raise
         except Exception:

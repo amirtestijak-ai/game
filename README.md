@@ -1,6 +1,33 @@
-# Vynexa News Bot hotfix
-France24 Iran source switched to a domain-restricted Google News RSS query to avoid direct-feed HTTP 403.
-First startup now queues a limited batch of current headlines rather than silently marking all current items old.
-Newest headlines are processed first. Translation failures no longer block publication.
-No OPENAI_API_KEY is required. Keep BOT_TOKEN, ADMIN_ID and the persistent secret_society.sqlite3 database.
-Run: python bot.py
+# Vynexa News Bot
+
+ربات انتشار خودکار خبر فارسی برای تلگرام.
+
+## فایل‌های لازم
+- `bot.py` فایل اصلی ربات
+- `requirements.txt` وابستگی‌ها
+- `Procfile` دستور اجرای ربات در هاست
+
+## تنظیم متغیرهای محیطی در هاست
+- `BOT_TOKEN` = توکن ربات تلگرام
+- `ADMIN_ID` = آیدی عددی مدیر
+- `NEWS_CHANNEL` = آیدی کانال مقصد، مثل `@YourChannel`
+- `PORT` = `8080` (در صورت نیاز هاست)
+- `OPENAI_API_KEY` = اختیاری؛ فقط اگر ترجمه با هوش مصنوعی می‌خواهی
+- `OPENAI_MODEL` = اختیاری؛ پیش‌فرض `gpt-4o-mini`
+
+بدون کلید هوش مصنوعی هم ربات کار می‌کند: ترجمه معمولی را با صف، فاصله‌گذاری، ذخیره ترجمه‌ها و تلاش مجدد خودکار انجام می‌دهد. اگر کلید OpenAI تنظیم شود، ترجمه هوشمند را امتحان می‌کند و در صورت خطا به روش جایگزین برمی‌گردد.
+
+## اجرای ربات
+Start Command هاست باید دقیقاً این باشد:
+
+```bash
+python bot.py
+```
+
+اگر فایل‌های قدیمی بازی در مخزن مانده‌اند، آن‌ها را از مخزن حذف کن یا مطمئن شو هاست فقط `bot.py` را اجرا می‌کند. فایل قدیمی `secret_society_bot.py` نباید اجرا شود.
+
+ربات را در کانال ادمین کن و اجازه ارسال پست بده. سپس در ربات `/panel` را بزن و کانال را تنظیم کن.
+
+فاصله پیش‌فرض بررسی خبرها ۶۰ ثانیه است. ترجمه‌ها در SQLite ذخیره می‌شوند تا خبرهای تکراری دوباره ترجمه نشوند. خبر در صورت اختلال ترجمه هم با عنوان اصلی و لینک منبع منتشر می‌شود و کل چرخه متوقف نمی‌شود.
+
+پایگاه داده پیش‌فرض `secret_society.sqlite3` است؛ برای حفظ تنظیمات و آمار، فایل دیتابیس را حذف نکن.
