@@ -21,7 +21,7 @@ import re
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import aiohttp
 import aiosqlite
@@ -654,9 +654,67 @@ async def translate_with_openai(text: str) -> str:
     return result
 
 
+def looks_persian(text: str) -> bool:
+    return bool(re.search(r"[\u0600-\u06FF]", text or ""))
+
+
+async def translate_with_lingva(text: str) -> str:
+    """Independent public translation frontends; no API key required."""
+    instances = [
+        "https://lingva.ml",
+        "https://translate.alefvanoon.xyz",
+        "https://translate.jae.fi",
+    ]
+    timeout = aiohttp.ClientTimeout(total=18)
+    last_error = None
+    for base in instances:
+        url = f"{base}/api/v1/auto/fa/{quote(text[:1800], safe='')}"
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"Lingva HTTP {resp.status}")
+                    data = await resp.json(content_type=None)
+            result = html.unescape((data.get("translation") or "").strip())
+            if result and looks_persian(result) and result != text:
+                return result
+            raise RuntimeError("Lingva returned no Persian translation")
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Lingva unavailable: {last_error}")
+
+
+async def translate_with_libretranslate(text: str) -> str:
+    """Open-source Argos/LibreTranslate engine, independent from Google/OpenAI."""
+    instances = [
+        "https://translate.terraprint.co/translate",
+        "https://translate.argosopentech.com/translate",
+        "https://libretranslate.de/translate",
+    ]
+    timeout = aiohttp.ClientTimeout(total=22)
+    last_error = None
+    for endpoint in instances:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    endpoint,
+                    json={"q": text[:1800], "source": "auto", "target": "fa", "format": "text"},
+                    headers={"Content-Type": "application/json", "User-Agent": "VynexaNews/1.0"},
+                ) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"LibreTranslate HTTP {resp.status}")
+                    data = await resp.json(content_type=None)
+            result = html.unescape((data.get("translatedText") or "").strip())
+            if result and looks_persian(result) and result != text:
+                return result
+            raise RuntimeError("LibreTranslate returned no Persian translation")
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"LibreTranslate unavailable: {last_error}")
+
+
 async def translate_with_mymemory(text: str) -> str:
-    """Secondary no-key translation provider used when Google is rate-limited."""
-    timeout = aiohttp.ClientTimeout(total=25)
+    timeout = aiohttp.ClientTimeout(total=18)
     params = {"q": text[:450], "langpair": "en|fa"}
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get("https://api.mymemory.translated.net/get", params=params) as resp:
@@ -664,10 +722,25 @@ async def translate_with_mymemory(text: str) -> str:
             data = await resp.json(content_type=None)
     if data.get("responseStatus") != 200:
         raise RuntimeError("MyMemory translation unavailable")
-    result = (data.get("responseData") or {}).get("translatedText", "").strip()
-    result = html.unescape(result)
-    if not result or result.lower() == text.lower():
-        raise RuntimeError("MyMemory returned no translation")
+    result = html.unescape((data.get("responseData") or {}).get("translatedText", "").strip())
+    if not result or not looks_persian(result):
+        raise RuntimeError("MyMemory returned no Persian translation")
+    return result
+
+
+async def translate_with_google(text: str) -> str:
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {"client": "gtx", "sl": "auto", "tl": "fa", "dt": "t", "q": text[:1800]}
+    timeout = aiohttp.ClientTimeout(total=18)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params) as resp:
+            if resp.status == 429:
+                raise RuntimeError("Google Translate rate limited (429)")
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+    result = "".join(part[0] for part in data[0] if part and part[0]).strip()
+    if not result or not looks_persian(result):
+        raise RuntimeError("Google returned no Persian translation")
     return result
 
 
@@ -676,100 +749,68 @@ async def translate_text(text: str) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    text = text[:3000]
+    if looks_persian(text):
+        return text
+    text = text[:1800]
     cached = await cached_translation(text)
     if cached:
         return cached
 
     async with TRANSLATION_LOCK:
-        # Re-check after acquiring the lock; another coroutine may have filled it.
         cached = await cached_translation(text)
         if cached:
             return cached
 
+        providers = []
         if OPENAI_API_KEY:
+            providers.append(("OpenAI", translate_with_openai))
+        # Independent providers are attempted before Google, so a Google 429
+        # cannot block the whole publishing pipeline.
+        providers.extend([
+            ("LibreTranslate", translate_with_libretranslate),
+            ("Lingva", translate_with_lingva),
+            ("MyMemory", translate_with_mymemory),
+            ("Google", translate_with_google),
+        ])
+        errors = []
+        for name, provider in providers:
             try:
-                translated = await translate_with_openai(text)
+                if name == "Google":
+                    wait = max(0.0, 8.0 - (time.monotonic() - TRANSLATION_LAST_CALL))
+                    if wait:
+                        await asyncio.sleep(wait)
+                    TRANSLATION_LAST_CALL = time.monotonic()
+                translated = (await provider(text)).strip()
+                if not translated or not looks_persian(translated):
+                    raise RuntimeError("Provider response is not Persian")
                 await save_translation(text, translated)
+                log.info("Translation provider succeeded: %s", name)
                 return translated
             except Exception as exc:
-                log.warning("AI translation failed; falling back to Google: %s", str(exc)[:150])
-
-        # Serialize public Google requests and back off automatically on 429/5xx.
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {"client": "gtx", "sl": "auto", "tl": "fa", "dt": "t", "q": text}
-        timeout = aiohttp.ClientTimeout(total=20)
-        last_error = None
-        for attempt in range(4):
-            wait = max(0.0, 2.5 - (time.monotonic() - TRANSLATION_LAST_CALL))
-            if wait:
-                await asyncio.sleep(wait)
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, params=params) as resp:
-                        TRANSLATION_LAST_CALL = time.monotonic()
-                        if resp.status == 429 or resp.status >= 500:
-                            retry_after = resp.headers.get("Retry-After", "")
-                            try:
-                                delay = min(45.0, max(5.0, float(retry_after)))
-                            except (TypeError, ValueError):
-                                delay = min(45.0, 5.0 * (2 ** attempt))
-                            last_error = RuntimeError(f"Google Translate HTTP {resp.status}")
-                            if attempt < 3:
-                                log.warning("Translation rate limited; retrying in %.0fs", delay)
-                                await asyncio.sleep(delay)
-                                continue
-                            raise last_error
-                        resp.raise_for_status()
-                        data = await resp.json(content_type=None)
-                translated = "".join(part[0] for part in data[0] if part and part[0]).strip()
-                if translated:
-                    await save_translation(text, translated)
-                    return translated
-                raise RuntimeError("Empty translation response")
-            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
-                last_error = exc
-                if attempt < 3 and not (isinstance(exc, RuntimeError) and "HTTP 429" in str(exc)):
-                    await asyncio.sleep(min(20, 2 ** (attempt + 1)))
-        # Last no-key fallback. MyMemory has smaller limits, so keep requests short.
-        try:
-            translated = await translate_with_mymemory(text[:450])
-            await save_translation(text, translated)
-            return translated
-        except Exception as exc:
-            log.warning("MyMemory translation fallback failed: %s", str(exc)[:140])
-        raise RuntimeError(f"Translation unavailable: {last_error}")
+                errors.append(f"{name}: {str(exc)[:100]}")
+                log.warning("Translation provider %s failed: %s", name, str(exc)[:120])
+        raise RuntimeError("All translation providers failed: " + " | ".join(errors))
 
 
 async def make_persian_copy(item):
-    # Translate title and excerpt together when AI is configured to reduce API calls.
-    title = item["title"]
+    title = (item.get("title") or "").strip()
     excerpt = (item.get("summary") or "").strip()[:900]
-    if OPENAI_API_KEY:
-        combined = "HEADLINE: " + title + ("\nEXCERPT: " + excerpt if excerpt else "")
-        try:
-            translated = await translate_text(combined)
-            if "\n" in translated:
-                first, rest = translated.split("\n", 1)
-                first = re.sub(r"^(عنوان|HEADLINE)\s*:\s*", "", first, flags=re.I).strip()
-                rest = re.sub(r"^(خلاصه|متن|EXCERPT)\s*:\s*", "", rest, flags=re.I).strip()
-                return first[:320] or title, concise_summary(rest, 360)
-            return translated[:320] or title, ""
-        except Exception as exc:
-            log.warning("Combined AI translation failed: %s", str(exc)[:140])
+    if not title:
+        raise RuntimeError("Article has no title")
 
-    try:
-        title_fa = await translate_text(title)
-    except Exception as exc:
-        log.warning("Title translation unavailable; publishing original title: %s", str(exc)[:140])
-        title_fa = title
+    # Persian feeds need no translation. For other feeds translate headline and
+    # summary separately so a long excerpt cannot corrupt the headline.
+    title_fa = await translate_text(title)
+    if not looks_persian(title_fa):
+        raise RuntimeError("Persian headline translation unavailable; article held")
     summary_fa = ""
     if excerpt:
         try:
             summary_fa = await translate_text(excerpt)
         except Exception as exc:
-            log.warning("RSS excerpt translation unavailable; publishing without excerpt: %s", str(exc)[:140])
-    return (title_fa or title)[:320], concise_summary(summary_fa, 360)
+            # A headline is essential; summary is optional and may be omitted.
+            log.warning("Summary translation unavailable; publishing headline only: %s", str(exc)[:140])
+    return title_fa[:320], concise_summary(summary_fa, 360)
 
 
 def classify_item(item):
