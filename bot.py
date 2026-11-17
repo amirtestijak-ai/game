@@ -7,7 +7,7 @@ Run:
     BOT_TOKEN=... ADMIN_ID=... python bot.py
 
 Optional:
-    OPENAI_API_KEY=...       # original Persian summaries (otherwise headline translation only)
+    OPENAI_API_KEY=...       # optional AI translation; RSS excerpts are translated when available
     OPENAI_MODEL=gpt-4o-mini
     DB_PATH=newsbot.sqlite3
     PORT=8080                # optional health endpoint for hosting platforms
@@ -20,6 +20,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from urllib.parse import urlparse
 
 import aiohttp
@@ -34,6 +35,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+    InputMediaPhoto, InputMediaVideo,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -65,8 +67,17 @@ dp = Dispatcher(storage=MemoryStorage())
 # old public RSS endpoints are no longer maintained.
 SOURCES = [
     {
-        "id": "iranintl", "name": "Iran International",
+        "id": "iranintl_fa", "name": "Iran International فارسی",
+        "url": "https://www.iranintl.com/feed", "category": "iran",
+    },
+    {
+        "id": "iranintl", "name": "Iran International English",
         "url": "https://www.iranintl.com/en/feed", "category": "iran",
+    },
+    {
+        "id": "iranintl_liveblog", "name": "Iran International — پوشش زنده فارسی",
+        "url": "https://www.iranintl.com/fa/liveblog/iran-conflict-november17",
+        "category": "iran", "type": "liveblog",
     },
     # Extra discovery feeds ensure Iran International stories are not missed
     # when its general RSS feed is busy with other subjects.
@@ -139,9 +150,11 @@ PROTEST_TERMS = (
     "protest", "protests", "protester", "protesters", "demonstration",
     "demonstrations", "strike", "strikes", "walkout", "unrest", "rally",
     "retirees", "workers protest", "student protest", "teachers protest",
+    "labor protest", "labor strike", "nationwide strike", "street protest",
+    "march", "demonstrators", "unrest", "uprising",
     "اعتراض", "اعتراضات", "اعتراضی", "معترض", "معترضان", "تجمع",
     "تجمعات", "اعتصاب", "اعتصابات", "اعتصابی", "بازنشستگان",
-    "دانشجویان", "کارگران", "فرهنگیان", "کسبه",
+    "دانشجویان", "کارگران", "فرهنگیان", "کسبه", "مردم معترض",
 )
 
 
@@ -328,7 +341,147 @@ def entry_timestamp(entry) -> int:
     return 0
 
 
+class LiveBlogParser(HTMLParser):
+    """Extract update cards from a liveblog page without assuming a site CSS class."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks = []
+        self.current = None
+        self.capture = None
+        self.capture_parts = []
+        self.in_article = 0
+        self.pending_date = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "article":
+            self.in_article += 1
+        if tag in ("h2", "h3", "h4"):
+            self._finish_capture()
+            self._finish_block()
+            self.current = {"title": "", "parts": [], "date": self.pending_date, "image": None, "video": None}
+            self.pending_date = ""
+            self.capture, self.capture_parts = "title", []
+        elif tag == "time":
+            self._finish_capture()
+            self.capture = "date"
+            self.capture_parts = []
+            if attrs.get("datetime"):
+                if self.current is not None:
+                    self.current["date"] = attrs["datetime"]
+                else:
+                    self.pending_date = attrs["datetime"]
+        elif tag == "p" and self.current is not None:
+            self._finish_capture()
+            self.capture = "text"
+            self.capture_parts = []
+        elif tag == "img" and self.current is not None:
+            src = attrs.get("src") or attrs.get("data-src") or attrs.get("data-lazy-src")
+            if src and src.startswith("http") and not self.current["image"]:
+                self.current["image"] = src
+        elif tag in ("video", "source") and self.current is not None:
+            src = attrs.get("src")
+            if src and src.startswith("http") and (src.lower().split("?",1)[0].endswith((".mp4", ".webm", ".mov"))):
+                self.current["video"] = src
+
+    def handle_endtag(self, tag):
+        if tag in ("h2", "h3", "h4", "p", "time"):
+            self._finish_capture()
+        if tag == "article":
+            self.in_article = max(0, self.in_article - 1)
+            if self.current:
+                self._finish_block()
+
+    def handle_data(self, data):
+        if not data.strip():
+            return
+        if self.capture:
+            self.capture_parts.append(data.strip())
+        elif self.current is not None:
+            # Some liveblog layouts put update text in nested divs, not <p> tags.
+            self.current["parts"].append(data.strip())
+
+    def _finish_capture(self):
+        if not self.capture:
+            return
+        value = re.sub(r"\s+", " ", " ".join(self.capture_parts)).strip()
+        if self.current and value:
+            if self.capture == "title":
+                self.current["title"] = value
+            elif self.capture == "date":
+                if self.current is not None and not self.current["date"]:
+                    self.current["date"] = value
+                elif self.current is None:
+                    self.pending_date = value
+            elif self.capture == "text":
+                self.current["parts"].append(value)
+        self.capture, self.capture_parts = None, []
+
+    def _finish_block(self):
+        if self.current:
+            self.blocks.append(self.current)
+            self.current = None
+
+    def finish(self):
+        self._finish_capture()
+        self._finish_block()
+        return self.blocks
+
+
+def liveblog_timestamp(value):
+    if not value:
+        return int(time.time())
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        try:
+            dt = parsedate_to_datetime(value)
+            return int(dt.timestamp())
+        except Exception:
+            return int(time.time())
+
+
+async def fetch_liveblog(session, source):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; VynexaNewsBot/1.0)"}
+    async with session.get(source["url"], headers=headers, timeout=aiohttp.ClientTimeout(total=22)) as resp:
+        if resp.status >= 400:
+            raise RuntimeError(f"HTTP {resp.status}")
+        raw = await resp.text(errors="replace")
+    parser = LiveBlogParser()
+    parser.feed(raw)
+    blocks = parser.finish()
+    results, seen_titles = [], set()
+    for block in blocks:
+        title = clean_html(block.get("title", ""))
+        summary = " ".join(block.get("parts", []))
+        if len(title) < 12 or not summary or title.casefold() in seen_titles:
+            continue
+        seen_titles.add(title.casefold())
+        # Ignore the page-level heading and generic navigation headings.
+        if title.casefold() in ("تغطية مباشرة", "آخرین اخبار", "آخرین خبرها"):
+            continue
+        stamp = liveblog_timestamp(block.get("date"))
+        identity = "|".join((source["url"], block.get("date", ""), title, summary[:180]))
+        guid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        results.append({
+            "guid": guid, "source_id": source["id"], "source_name": source["name"],
+            "source_category": source["category"], "title": title[:500],
+            "summary": summary[:1200], "link": source["url"],
+            "image": block.get("image"), "video": block.get("video"), "timestamp": stamp,
+        })
+    if not results:
+        raise RuntimeError("Liveblog page loaded, but no update cards could be parsed")
+    return source["id"], results[:40], None
+
+
 async def fetch_source(session: aiohttp.ClientSession, source):
+    if source.get("type") == "liveblog":
+        try:
+            return await fetch_liveblog(session, source)
+        except Exception as exc:
+            return source["id"], [], f"{type(exc).__name__}: {str(exc)[:180]}"
     headers = {"User-Agent": "VynexaNewsBot/1.0 (RSS reader; contact admin via Telegram)"}
     try:
         async with session.get(source["url"], headers=headers, timeout=aiohttp.ClientTimeout(total=18)) as resp:
@@ -344,7 +497,19 @@ async def fetch_source(session: aiohttp.ClientSession, source):
             link = str(entry.get("link") or "").strip()
             if not title or not link.startswith("http"):
                 continue
-            summary = clean_html(entry.get("summary", "") or entry.get("description", ""))
+            # Prefer the publisher's full RSS content, then its summary/description.
+            # Many feeds put the useful explanation in content:encoded rather than summary.
+            summary_parts = []
+            for content_item in (entry.get("content", []) or []):
+                value = clean_html(content_item.get("value", ""))
+                if value and value not in summary_parts:
+                    summary_parts.append(value)
+            for field in (entry.get("summary", ""), entry.get("description", ""),
+                          entry.get("subtitle", "")):
+                value = clean_html(field)
+                if value and value not in summary_parts:
+                    summary_parts.append(value)
+            summary = max(summary_parts, key=len, default="")
             results.append({
                 "guid": entry_guid(source["id"], entry),
                 "source_id": source["id"],
@@ -581,10 +746,19 @@ async def publish_item(item):
 
     post_images = await get_setting("post_images", POST_IMAGES_DEFAULT) == "1"
     try:
-        if item.get("video"):
-            await bot.send_video(destination, video=item["video"], caption=caption, parse_mode="HTML")
-        elif post_images and item.get("image"):
-            await bot.send_photo(destination, photo=item["image"], caption=caption, parse_mode="HTML")
+        video_url = item.get("video")
+        image_url = item.get("image") if post_images else None
+        # If the feed provides both, publish them together as one Telegram album.
+        if video_url and image_url:
+            media = [
+                InputMediaPhoto(media=image_url, caption=caption, parse_mode="HTML"),
+                InputMediaVideo(media=video_url),
+            ]
+            await bot.send_media_group(destination, media=media)
+        elif video_url:
+            await bot.send_video(destination, video=video_url, caption=caption, parse_mode="HTML")
+        elif image_url:
+            await bot.send_photo(destination, photo=image_url, caption=caption, parse_mode="HTML")
         else:
             await bot.send_message(destination, caption, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as exc:
@@ -615,7 +789,8 @@ async def seed_existing_articles(session):
     results = await asyncio.gather(*tasks)
     for source_id, entries, error in results:
         for item in entries:
-            await mark_seen(item, classify_item(item))
+            if item.get("source_id") != "iranintl_liveblog":
+                await mark_seen(item, classify_item(item))
         if error:
             log.warning("Seed feed %s: %s", source_id, error)
     await set_setting("seeded", "1")
@@ -657,38 +832,48 @@ async def poll_once():
     # Deduplicate by canonical article URL before selecting posts.
     unique = {}
     for item in candidates:
-        canonical = item["link"].split("?", 1)[0].rstrip("/")
-        if canonical not in unique or item["source_id"] == "iranintl":
+        # Every update in one liveblog shares the page URL; dedupe those by update GUID.
+        canonical = (item["guid"] if item.get("source_id") == "iranintl_liveblog"
+                     else item["link"].split("?", 1)[0].rstrip("/"))
+        current = unique.get(canonical)
+        official_rank = 0 if item["source_id"].startswith("iranintl") else 1
+        current_rank = (0 if current and current["source_id"].startswith("iranintl") else 1) if current else 9
+        if current is None or official_rank < current_rank:
             unique[canonical] = item
     candidates = list(unique.values())
 
-    # Newest items first; within Iran coverage, protests and strikes come first.
-    candidates.sort(key=lambda x: x["timestamp"], reverse=True)
-    protest_items = [x for x in candidates if is_protest_item(x)]
-    iran_items = [x for x in candidates if x["category"] == "iran" and not is_protest_item(x)]
+    # Strict priority: Iran International protest coverage first, then all other
+    # Iran International stories, then other Iran protest/news, and world last.
+    iranintl_items = [x for x in candidates if x.get("source_id", "").startswith("iranintl")]
+    other_iran_items = [x for x in candidates if x["category"] == "iran" and x not in iranintl_items]
     world_items = [x for x in candidates if x["category"] == "world"]
 
-    iran_count, world_count, total_count = await current_ratio_counts()
-    iran_share = (iran_count / total_count) if total_count else 1.0
-    iran_target = int(await get_setting("iran_percent", "80"))
-    world_target = 100 - iran_target
+    def rank(item):
+        official = item.get("source_id", "").startswith("iranintl")
+        protest = is_protest_item(item)
+        if official and protest:
+            return 0
+        if official:
+            return 1
+        if protest and item["category"] == "iran":
+            return 2
+        if item["category"] == "iran":
+            return 3
+        return 4
 
-    # Protest coverage overrides the normal Iran/world quota. Then other Iran
-    # International and Iran stories are preferred; world stories fill spare slots.
-    chosen = protest_items[:MAX_POSTS_PER_CYCLE]
+    candidates.sort(key=lambda x: (rank(x), -x["timestamp"]))
+    # Fill all five slots from Iran International whenever available.
+    chosen = iranintl_items.copy()
+    chosen.sort(key=lambda x: (0 if is_protest_item(x) else 1, -x["timestamp"]))
+    chosen = chosen[:MAX_POSTS_PER_CYCLE]
     remaining_slots = MAX_POSTS_PER_CYCLE - len(chosen)
     if remaining_slots:
-        chosen.extend(iran_items[:remaining_slots])
+        other_iran_items.sort(key=lambda x: (0 if is_protest_item(x) else 1, -x["timestamp"]))
+        chosen.extend(other_iran_items[:remaining_slots])
     remaining_slots = MAX_POSTS_PER_CYCLE - len(chosen)
     if remaining_slots:
-        _, _, recent_total = await current_ratio_counts()
-        world_allowed = (
-            not (protest_items or iran_items) or
-            (recent_total >= 5 and iran_share >= iran_target / 100) or
-            (world_count < max(1, round((recent_total + 1) * world_target / 100)))
-        )
-        if world_allowed:
-            chosen.extend(world_items[:remaining_slots])
+        world_items.sort(key=lambda x: x["timestamp"], reverse=True)
+        chosen.extend(world_items[:remaining_slots])
 
     posted = 0
     for item in chosen:
